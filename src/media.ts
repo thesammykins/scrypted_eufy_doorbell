@@ -57,6 +57,11 @@ export function streamOptions(variant: StreamVariant, view?: LensView, info?: Li
     } as ResponseMediaStreamOptions;
 }
 
+/** The dual-lens doorbell stacks its two lenses into a frame much taller than it is wide. */
+export function isStacked(width: number, height: number) {
+    return height > width * 1.2;
+}
+
 function fitWithin(size: { width?: number; height?: number }, box: { width: number; height: number }) {
     if (!size.width || !size.height)
         return { ...box };
@@ -101,8 +106,13 @@ function maps(info: LiveStreamInfo) {
  * Closing the socket kills the muxer, which closes the worker's sockets, which ends the P2P pull.
  */
 export async function createFFmpegInput(info: LiveStreamInfo, console: Console, transcode: H264Transcode, variant: StreamVariant, view?: LensView): Promise<FFmpegInput> {
+    // The doorbell does not always send the stacked dual-lens frame (it has been seen switching to a plain
+    // 1920x1080 H.264 picture). Compose only a frame that really is stacked; anything else passes through.
+    const stacked = !!info.video.width && !!info.video.height && isStacked(info.video.width, info.video.height);
+    if (view && !stacked)
+        console.log(`camera sent a ${info.video.width}x${info.video.height} frame, not the stacked dual-lens layout; passing it through`);
     const filters = [
-        ...(view ? [view.filter] : []),
+        ...(view && stacked ? [view.filter] : []),
         ...(variant.fit ? [`scale=w=${variant.fit.width}:h=${variant.fit.height}:force_original_aspect_ratio=decrease:force_divisible_by=2`] : []),
     ];
     const video = info.video.codec === 'h264' && !filters.length && !variant.baseline

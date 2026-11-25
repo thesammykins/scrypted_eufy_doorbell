@@ -406,6 +406,11 @@ function jsonStore<T>(kind: 'session' | 'push', initial: unknown) {
 // drop the cache and let it wait for the next keyframe instead.
 const MAX_GOP_BYTES = 16 * 1024 * 1024;
 
+/** Same rule the plugin composes by: the stacked dual-lens frame is much taller than wide. */
+function stackedShape(size: { width?: number; height?: number }) {
+    return !!size.width && !!size.height && size.height > size.width * 1.2;
+}
+
 interface Viewer {
     streamId: string;
     startedAt: number;
@@ -428,6 +433,7 @@ class SharedLive {
     audioFormat?: AudioFormat;
     private gop: Buffer[] = [];
     private gopBytes = 0;
+    private foreignFrames = 0;
     private readonly viewers = new Set<Viewer>();
     private readonly startedAt = Date.now();
     private ended = false;
@@ -463,7 +469,21 @@ class SharedLive {
         this.firstAudio = new Promise<void>(resolve => this.gotAudio = resolve);
 
         consumer.on('video', frame => {
+            // The station can interleave the doorbell's low-res substream (H.264, e.g. 480x690) into the same feed
+            // as the main H.265 stream. Mixing them into one decoder shows nested pictures at different sizes,
+            // so lock onto the first keyframe's codec and drop the other encoding.
+            if (this.codec && frame.codec !== this.codec) {
+                if (this.foreignFrames++ === 0)
+                    log.info(`live ${sn}: ignoring interleaved ${frame.codec} ${frame.width}x${frame.height} frames (substream) in the ${this.codec} feed`);
+                return;
+            }
             if (frame.keyframe) {
+                // The main stream itself changing shape means every viewer's dual-lens composition is now wrong.
+                // End the pull; Scrypted reconnects and the plugin rebuilds it for the new shape.
+                if (this.codec && stackedShape(frame) !== stackedShape(this.size)) {
+                    this.end(`camera changed shape from ${this.size.width}x${this.size.height} to ${frame.width}x${frame.height}`);
+                    return;
+                }
                 if (!this.codec) {
                     if (frame.codec !== 'h264' && frame.codec !== 'h265') {
                         this.end(`unsupported video codec ${frame.codec}`);
@@ -543,7 +563,7 @@ class SharedLive {
         this.consumer.stop();
         for (const viewer of [...this.viewers])
             this.detach(viewer, reason);
-        log.info(`live ${this.sn} pull ended after ${Math.round((Date.now() - this.startedAt) / 1000)}s: ${reason}`);
+        log.info(`live ${this.sn} pull ended after ${Math.round((Date.now() - this.startedAt) / 1000)}s: ${reason}${this.foreignFrames ? ` (dropped ${this.foreignFrames} substream frames)` : ''}`);
     }
 
     get isEnded() {
