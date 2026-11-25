@@ -137,6 +137,13 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings,
             choices: ['Ring', 'Ring and person', 'Off'],
             defaultValue: 'Ring',
         },
+        stillRefresh: {
+            title: 'Refresh Snapshot',
+            description: 'Wakes the doorbell for one frame only when no event or live view gave a newer picture. Never below the low battery level.',
+            choices: ['Every hour', 'Every 3 hours', 'Off'],
+            defaultValue: 'Every hour',
+            group: 'Battery',
+        },
         lowBatteryThreshold: {
             title: 'Low Battery Alert (%)',
             type: 'number',
@@ -176,7 +183,7 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings,
         this.worker = new WorkerHost(volume, workerBundle, this.console, () => this.start());
         this.thumbnails = new ThumbnailStore(volume);
         this.batteryAlerts = new BatteryAlerts({
-            threshold: () => Number(this.storageSettings.values.lowBatteryThreshold) || 20,
+            threshold: () => this.lowBatteryThreshold(),
             notifierIds: () => [this.storageSettings.values.batteryNotifiers ?? []].flat().filter(Boolean),
             alerted: sn => !!(this.storageSettings.values.batteryAlerted || {})[sn],
             setAlerted: (sn, alerted) => this.storageSettings.values.batteryAlerted = { ...(this.storageSettings.values.batteryAlerted || {}), [sn]: alerted },
@@ -216,6 +223,10 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings,
         this.cameras.delete(nativeId);
     }
 
+    private lowBatteryThreshold() {
+        return Number(this.storageSettings.values.lowBatteryThreshold) || 20;
+    }
+
     private getCamera(nativeId: string) {
         let camera = this.cameras.get(nativeId);
         if (!camera) {
@@ -224,6 +235,8 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings,
                 archive: this.archive,
                 thumbnails: this.thumbnails,
                 maxLiveSeconds: () => Number(this.storageSettings.values.maxLiveSeconds) || 300,
+                stillRefreshMinutes: () => ({ 'Every hour': 60, 'Every 3 hours': 180, Off: 0 } as Record<string, number>)[this.storageSettings.values.stillRefresh] ?? 60,
+                lowBatteryThreshold: () => this.lowBatteryThreshold(),
                 transcode: () => this.transcode(),
                 clipUrlBase: async () => `${await endpointManager.getAuthenticatedPath(this.nativeId)}clips/`,
             });

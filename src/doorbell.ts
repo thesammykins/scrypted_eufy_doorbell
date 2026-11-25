@@ -22,6 +22,12 @@ const RING_RESET_MS = 10_000;
 const MOTION_RESET_MS = 10_000;
 // Eufy fetches the event thumbnail a few seconds after the push; pick it up and keep it on disk.
 const THUMBNAIL_CAPTURE_DELAYS_MS = [4_000, 12_000];
+// How often to check whether the snapshot is due for a refresh.
+const STILL_CHECK_MS = 5 * 60_000;
+// A live view refreshes the snapshot for free, but not more often than this.
+const STILL_FROM_VIEW_MIN_AGE_MS = 5 * 60_000;
+// Wait for the viewer's pull to settle before reading a frame from it.
+const STILL_FROM_VIEW_DELAY_MS = 3_000;
 
 export interface CameraContext {
     worker: WorkerHost;
@@ -29,6 +35,10 @@ export interface CameraContext {
     thumbnails: ThumbnailStore;
     transcode(): Promise<H264Transcode>;
     maxLiveSeconds(): number;
+    /** Refresh the snapshot by waking the doorbell when it is older than this; 0 never wakes it. */
+    stillRefreshMinutes(): number;
+    /** Below this battery level the doorbell is never woken for a snapshot. */
+    lowBatteryThreshold(): number;
     /** Authenticated URL prefix the plugin serves archived clip files under. */
     clipUrlBase(): Promise<string>;
 }
@@ -47,6 +57,8 @@ export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Cam
     private intercom: IntercomState = { kind: 'idle' };
     private lastSnapshotSource?: string;
     private warmers: ChildProcess[] = [];
+    private stillTimer?: NodeJS.Timeout;
+    private stillBusy = false;
 
     private readonly sn: string;
     private readonly view?: LensView;
@@ -63,6 +75,42 @@ export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Cam
         if (info.batteryLevel !== undefined)
             this.batteryLevel = info.batteryLevel;
         this.online = true;
+        this.stillTimer ??= setInterval(() => this.refreshStillIfDue(), STILL_CHECK_MS);
+    }
+
+    /**
+     * Wakes the doorbell for one frame when the snapshot is older than the refresh interval. Any event
+     * thumbnail or live view inside the interval makes it unnecessary, and a low battery skips it.
+     */
+    private async refreshStillIfDue() {
+        const minutes = this.context.stillRefreshMinutes();
+        if (!minutes || this.stillBusy)
+            return;
+        const age = this.context.thumbnails.latest(this.sn)?.ageMs ?? Infinity;
+        if (age < minutes * 60_000)
+            return;
+        if (this.batteryLevel !== undefined && this.batteryLevel <= this.context.lowBatteryThreshold()) {
+            this.console.log(`snapshot refresh skipped: battery ${this.batteryLevel}%`);
+            return;
+        }
+        await this.takeLiveStill(true);
+    }
+
+    private async takeLiveStill(wake: boolean) {
+        if (this.stillBusy)
+            return;
+        this.stillBusy = true;
+        try {
+            const { jpegBase64, woke, ms } = await this.context.worker.call('liveStill', { sn: this.sn, wake });
+            this.context.thumbnails.save(this.sn, Buffer.from(jpegBase64, 'base64'), 'live');
+            this.console.log(woke ? `snapshot refreshed, doorbell awake ${ms}ms` : 'snapshot refreshed from the live view');
+        }
+        catch (e) {
+            this.console.warn(`snapshot refresh failed: ${(e as Error).message}`);
+        }
+        finally {
+            this.stillBusy = false;
+        }
     }
 
     onRing() {
@@ -148,6 +196,8 @@ export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Cam
         const started = Date.now();
         const info = await this.context.worker.call('live', { sn: this.sn, maxSeconds: this.context.maxLiveSeconds() });
         this.console.log(`live stream ready in ${Date.now() - started}ms: ${info.video.codec} ${info.video.width}x${info.video.height}, audio ${info.audio?.format ?? 'none'}, serving ${variant.id}`);
+        if ((this.context.thumbnails.latest(this.sn)?.ageMs ?? Infinity) > STILL_FROM_VIEW_MIN_AGE_MS)
+            setTimeout(() => this.takeLiveStill(false), STILL_FROM_VIEW_DELAY_MS);
         try {
             const input = await createFFmpegInput(info, this.console, await this.context.transcode(), variant, view);
             return await mediaManager.createFFmpegMediaObject(input);
@@ -162,8 +212,8 @@ export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Cam
 
     /**
      * Throwing here would make the Snapshot plugin fall back to opening a live stream, i.e. waking the
-     * camera for every tile refresh. So: the thumbnail Eufy pushed with the last event, else the copy kept
-     * on disk, else a frame of the last archived ring clip, else a blank frame.
+     * camera for every tile refresh. So: the newer of Eufy's last event thumbnail and the last live frame,
+     * else a frame of the last archived ring clip, else a blank frame.
      */
     async takePicture(): Promise<MediaObject> {
         const ffmpeg = await mediaManager.getFFmpegPath();
@@ -179,21 +229,16 @@ export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Cam
     }
 
     private async latestStill(ffmpeg: string): Promise<{ source: string; jpeg: Buffer }> {
-        try {
-            const { jpegBase64 } = await this.context.worker.call('snapshot', { sn: this.sn });
-            const jpeg = Buffer.from(jpegBase64, 'base64');
-            this.context.thumbnails.save(this.sn, jpeg);
-            return { source: 'eufy event thumbnail', jpeg };
-        }
-        catch {
-            const saved = this.context.thumbnails.load(this.sn);
-            if (saved)
-                return { source: 'saved eufy event thumbnail', jpeg: saved };
-            const clipThumb = this.context.archive.latestThumbnail(this.sn);
-            if (clipThumb)
-                return { source: 'last archived ring clip', jpeg: fs.readFileSync(clipThumb) };
-            return { source: 'placeholder (no eufy event yet)', jpeg: await placeholderJpeg(ffmpeg) };
-        }
+        await this.context.worker.call('snapshot', { sn: this.sn })
+            .then(({ jpegBase64 }) => this.context.thumbnails.save(this.sn, Buffer.from(jpegBase64, 'base64'), 'event'))
+            .catch(() => { });
+        const saved = this.context.thumbnails.latest(this.sn);
+        if (saved)
+            return { source: saved.kind === 'live' ? 'live frame' : 'eufy event thumbnail', jpeg: saved.jpeg };
+        const clipThumb = this.context.archive.latestThumbnail(this.sn);
+        if (clipThumb)
+            return { source: 'last archived ring clip', jpeg: fs.readFileSync(clipThumb) };
+        return { source: 'placeholder (no eufy event yet)', jpeg: await placeholderJpeg(ffmpeg) };
     }
 
     private captureThumbnail() {
@@ -201,7 +246,7 @@ export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Cam
             setTimeout(() => {
                 this.context.worker.call('snapshot', { sn: this.sn })
                     .then(({ jpegBase64 }) => {
-                        if (this.context.thumbnails.save(this.sn, Buffer.from(jpegBase64, 'base64')))
+                        if (this.context.thumbnails.save(this.sn, Buffer.from(jpegBase64, 'base64'), 'event'))
                             this.console.log('saved new eufy event thumbnail');
                     })
                     .catch(() => { });

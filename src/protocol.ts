@@ -64,6 +64,11 @@ export interface Methods {
     talkback: [{ sn: string }, TalkbackInfo];
     stopTalkback: [{ talkId: string }, void];
     snapshot: [{ sn: string }, { jpegBase64: string }];
+    /**
+     * A still decoded from the live pull's latest keyframe. With `wake: false` it only reads a pull that is
+     * already running (free); with `wake: true` it opens one just long enough for a keyframe.
+     */
+    liveStill: [{ sn: string; wake: boolean }, { jpegBase64: string; woke: boolean; ms: number }];
     setNotificationStyle: [{ sn: string; style: number }, void];
     /** The doorbell's clips in the HomeBase's own index over the last `days` days, newest first. */
     listRecordings: [{ sn: string; days: number }, RecordingEntry[]];

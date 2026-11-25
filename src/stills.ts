@@ -3,9 +3,13 @@ import fs from 'fs';
 import path from 'path';
 import type { LensView } from './lenses';
 
+export type StillKind = 'event' | 'live';
+
 /**
- * Last Eufy event thumbnail per camera, kept on disk so tiles survive a plugin restart instead of falling
- * back to a blank frame until the next event.
+ * Latest picture per camera, kept on disk so tiles survive a plugin restart instead of falling back to a
+ * blank frame until the next event. Eufy's event thumbnail and frames taken from the live pull are kept
+ * apart (the event thumbnail is re-offered unchanged on every read, so it must not overwrite a newer frame);
+ * whichever was written last is the snapshot.
  */
 export class ThumbnailStore {
     private readonly dir: string;
@@ -15,21 +19,26 @@ export class ThumbnailStore {
         fs.mkdirSync(this.dir, { recursive: true });
     }
 
-    save(sn: string, jpeg: Buffer) {
-        const file = this.file(sn);
+    save(sn: string, jpeg: Buffer, kind: StillKind) {
+        const file = this.file(sn, kind);
         if (fs.existsSync(file) && fs.statSync(file).size === jpeg.length && fs.readFileSync(file).equals(jpeg))
             return false;
         fs.writeFileSync(file, jpeg);
         return true;
     }
 
-    load(sn: string): Buffer | undefined {
-        const file = this.file(sn);
-        return fs.existsSync(file) ? fs.readFileSync(file) : undefined;
+    /** The newer of the event thumbnail and the live frame. */
+    latest(sn: string): { kind: StillKind; jpeg: Buffer; ageMs: number } | undefined {
+        const found = (['event', 'live'] as StillKind[])
+            .map(kind => ({ kind, file: this.file(sn, kind) }))
+            .filter(f => fs.existsSync(f.file))
+            .map(f => ({ ...f, mtime: fs.statSync(f.file).mtimeMs }))
+            .sort((a, b) => b.mtime - a.mtime)[0];
+        return found && { kind: found.kind, jpeg: fs.readFileSync(found.file), ageMs: Date.now() - found.mtime };
     }
 
-    private file(sn: string) {
-        return path.join(this.dir, `${sn.replace(/[^A-Za-z0-9]/g, '')}.jpg`);
+    private file(sn: string, kind: StillKind) {
+        return path.join(this.dir, `${sn.replace(/[^A-Za-z0-9]/g, '')}${kind === 'live' ? '.live' : ''}.jpg`);
     }
 }
 

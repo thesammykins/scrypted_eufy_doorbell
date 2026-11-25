@@ -124,6 +124,10 @@ const handlers: { [M in keyof Methods]: (params: Methods[M][0]) => Promise<Metho
         return { jpegBase64: jpeg.toString('base64') };
     },
 
+    async liveStill({ sn, wake }) {
+        return liveStill(sn, wake);
+    },
+
     async setNotificationStyle({ sn, style }) {
         await cameraOf(sn);
         await requireClient().setProperty(sn, 'notificationStyle', style);
@@ -445,6 +449,11 @@ class SharedLive {
     private gotAudio!: () => void;
     private failStart!: (e: Error) => void;
 
+    /** The running pull, without starting one. */
+    static peek(sn: string): Promise<SharedLive> | undefined {
+        return SharedLive.sessions.get(sn);
+    }
+
     static get(sn: string): Promise<SharedLive> {
         let session = SharedLive.sessions.get(sn);
         if (!session) {
@@ -536,6 +545,15 @@ class SharedLive {
         });
     }
 
+    keyframeWithin(ms: number) {
+        return Promise.race([this.firstKeyframe, new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`no keyframe within ${ms / 1000}s`)), ms))]);
+    }
+
+    /** The latest keyframe onward, enough to decode one picture. */
+    keyframeBurst() {
+        return Buffer.concat(this.gop);
+    }
+
     /** Joins a viewer: replays the frames since the last keyframe, then everything live. */
     attach(viewer: Viewer) {
         for (const data of this.gop)
@@ -577,12 +595,46 @@ class SharedLive {
     }
 }
 
+/**
+ * One JPEG from the doorbell's live pull. Reading a pull someone is already watching costs nothing; opening
+ * one wakes the doorbell, so the hold ends as soon as the first keyframe is decoded.
+ */
+async function liveStill(sn: string, wake: boolean) {
+    const started = Date.now();
+    const running = SharedLive.peek(sn);
+    if (!running && !wake)
+        throw new Error('not streaming');
+    const live = await (running ?? SharedLive.get(sn));
+    const holder: Viewer = { streamId: randomUUID(), startedAt: Date.now(), maxSeconds: 30, video: new SocketSink('still'), audio: new SocketSink('still') };
+    holder.video.close();
+    holder.audio.close();
+    live.attach(holder);
+    try {
+        await live.keyframeWithin(FIRST_KEYFRAME_TIMEOUT_MS);
+        const jpeg = await decodeStill(live.codec!, live.keyframeBurst());
+        log.info(`live ${sn} still ${running ? 'from the running pull' : 'woke the doorbell'} in ${Date.now() - started}ms`);
+        return { jpegBase64: jpeg.toString('base64'), woke: !running, ms: Date.now() - started };
+    }
+    finally {
+        live.detach(holder, 'still captured');
+    }
+}
+
+function decodeStill(codec: VideoCodec, burst: Buffer): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+        const cp = execFile(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-f', codec === 'h265' ? 'hevc' : 'h264', '-i', 'pipe:0', '-frames:v', '1', '-q:v', '3', '-f', 'image2', '-c:v', 'mjpeg', 'pipe:1'],
+            { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024, timeout: 15_000 },
+            (error, stdout) => error ? reject(new Error(`decoding still failed: ${error.message}`)) : stdout.length ? resolve(stdout) : reject(new Error('decoder produced no picture')));
+        cp.stdin!.on('error', () => { });
+        cp.stdin!.end(burst);
+    });
+}
+
 async function startLive(sn: string, maxSeconds: number): Promise<LiveStreamInfo> {
     const requestedAt = Date.now();
     const live = await SharedLive.get(sn);
-    const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`no keyframe within ${FIRST_KEYFRAME_TIMEOUT_MS / 1000}s`)), FIRST_KEYFRAME_TIMEOUT_MS));
     try {
-        await Promise.race([live.firstKeyframe, timeout]);
+        await live.keyframeWithin(FIRST_KEYFRAME_TIMEOUT_MS);
         await Promise.race([live.firstAudio, new Promise(resolve => setTimeout(resolve, AUDIO_SNIFF_MS))]);
     }
     catch (e) {
