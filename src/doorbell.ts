@@ -3,7 +3,7 @@ import fs from 'fs';
 import sdk, {
     Battery, BinarySensor, Camera, FFmpegInput, Intercom, MediaObject, MotionSensor, ObjectDetectionTypes, ObjectDetector,
     ObjectsDetected, Online, ResponseMediaStreamOptions, ResponsePictureOptions, ScryptedDeviceBase, ScryptedInterface,
-    RequestRecordingStreamOptions, ScryptedMimeTypes, VideoCamera, VideoClip, VideoClipOptions, VideoClips, VideoRecorder,
+    EventRecorder, RecordedEvent, RecordedEventOptions, RequestRecordingStreamOptions, ScryptedMimeTypes, VideoCamera, VideoClip, VideoClipOptions, VideoClips, VideoRecorder,
 } from '@scrypted/sdk';
 import type { RecordingArchive } from './archive';
 import { LensView, viewFor } from './lenses';
@@ -37,7 +37,7 @@ type IntercomState =
 const DETECTION_CLASSES: DetectionClass[] = ['person', 'package', 'vehicle', 'animal'];
 
 /** One Scrypted doorbell per Eufy doorbell; the native id is the Eufy serial. */
-export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Intercom, MotionSensor, BinarySensor, Battery, Online, VideoClips, VideoRecorder, ObjectDetector {
+export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Intercom, MotionSensor, BinarySensor, Battery, Online, VideoClips, VideoRecorder, EventRecorder, ObjectDetector {
     private ringReset?: NodeJS.Timeout;
     private motionReset?: NodeJS.Timeout;
     private intercom: IntercomState = { kind: 'idle' };
@@ -204,6 +204,26 @@ export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Cam
 
     // --- VideoRecorder: Scrypted NVR plays an event by asking for "the recording from time T". The archive is
     // that recording, sparse: one clip per Eufy event. Nothing here touches the doorbell. ---
+
+    /**
+     * With VideoRecorder present, NVR takes its event list from here rather than from VideoClips. Each archived
+     * clip is one event, shaped like NVR's own detections so it lands on the timeline and plays from there.
+     */
+    async getRecordedEvents(options: RecordedEventOptions): Promise<RecordedEvent[]> {
+        const clips = this.context.archive.list(this.sn, { startTime: options.startTime, endTime: options.endTime, count: options.count });
+        return clips.map(clip => {
+            const ring = clip.event === 'ring';
+            const data: ObjectsDetected = {
+                timestamp: clip.startTime,
+                detectionId: clip.id,
+                detections: [{ className: ring ? 'doorbell' : 'motion', label: ring ? 'Doorbell ring' : 'Motion', score: 1 }],
+            };
+            return {
+                details: { eventId: clip.id, eventInterface: ScryptedInterface.ObjectDetector, eventTime: clip.startTime },
+                data,
+            };
+        });
+    }
 
     async getRecordingStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
         return [{ ...streamOptions(this.view), id: 'archive', name: 'Eufy Event Clips' }];
