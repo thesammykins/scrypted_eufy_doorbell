@@ -1,8 +1,9 @@
+import { execFile } from 'child_process';
 import fs from 'fs';
 import sdk, {
     Battery, BinarySensor, Camera, FFmpegInput, Intercom, MediaObject, MotionSensor, ObjectDetectionTypes, ObjectDetector,
     ObjectsDetected, Online, ResponseMediaStreamOptions, ResponsePictureOptions, ScryptedDeviceBase, ScryptedInterface,
-    ScryptedMimeTypes, VideoCamera, VideoClip, VideoClipOptions, VideoClips,
+    RequestRecordingStreamOptions, ScryptedMimeTypes, VideoCamera, VideoClip, VideoClipOptions, VideoClips, VideoRecorder,
 } from '@scrypted/sdk';
 import type { RecordingArchive } from './archive';
 import { LensView, viewFor } from './lenses';
@@ -36,11 +37,13 @@ type IntercomState =
 const DETECTION_CLASSES: DetectionClass[] = ['person', 'package', 'vehicle', 'animal'];
 
 /** One Scrypted doorbell per Eufy doorbell; the native id is the Eufy serial. */
-export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Intercom, MotionSensor, BinarySensor, Battery, Online, VideoClips, ObjectDetector {
+export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Camera, Intercom, MotionSensor, BinarySensor, Battery, Online, VideoClips, VideoRecorder, ObjectDetector {
     private ringReset?: NodeJS.Timeout;
     private motionReset?: NodeJS.Timeout;
     private intercom: IntercomState = { kind: 'idle' };
     private lastSnapshotSource?: string;
+    /** Where the most recent archive playback started, to answer "what time is playing now". */
+    private playback?: { time: number; startedAt: number; rate: number };
 
     private readonly sn: string;
     private readonly view?: LensView;
@@ -197,6 +200,50 @@ export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Cam
 
     async removeVideoClips(...videoClipIds: string[]): Promise<void> {
         this.context.archive.remove(videoClipIds);
+    }
+
+    // --- VideoRecorder: Scrypted NVR plays an event by asking for "the recording from time T". The archive is
+    // that recording, sparse: one clip per Eufy event. Nothing here touches the doorbell. ---
+
+    async getRecordingStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
+        return [{ ...streamOptions(this.view), id: 'archive', name: 'Eufy Event Clips' }];
+    }
+
+    async getRecordingStream(options: RequestRecordingStreamOptions): Promise<MediaObject> {
+        const clip = this.context.archive.clipAt(this.sn, options.startTime);
+        if (!clip)
+            throw new Error(`no Eufy event clip at ${new Date(options.startTime).toLocaleString()}; only events are recorded`);
+        const rate = options.playbackRate || 1;
+        this.playback = { time: clip.startTime + clip.offsetMs, startedAt: Date.now(), rate };
+        this.console.log(`playing archived clip from ${new Date(clip.startTime).toLocaleTimeString()} at +${Math.round(clip.offsetMs / 1000)}s`);
+        return mediaManager.createFFmpegMediaObject({
+            inputArguments: [
+                // Real time (or the requested speed): the player treats this like a live stream.
+                ...(rate === 1 ? ['-re'] : ['-readrate', String(rate)]),
+                '-ss', (clip.offsetMs / 1000).toFixed(3),
+                ...(options.loop ? ['-stream_loop', '-1'] : []),
+                '-i', clip.path,
+            ],
+            mediaStreamOptions: { ...streamOptions(this.view), id: 'archive', container: 'mp4' },
+        });
+    }
+
+    async getRecordingStreamCurrentTime(): Promise<number> {
+        const p = this.playback;
+        return p ? p.time + (Date.now() - p.startedAt) * p.rate : Date.now();
+    }
+
+    /** A frame from the archived clip at `time`, so scrubbing NVR's timeline shows the right moment. */
+    async getRecordingStreamThumbnail(time: number): Promise<MediaObject> {
+        const clip = this.context.archive.clipAt(this.sn, time, 0);
+        if (!clip)
+            return this.takePicture();
+        const ffmpeg = await mediaManager.getFFmpegPath();
+        const jpeg = await new Promise<Buffer>((resolve, reject) => execFile(ffmpeg,
+            ['-hide_banner', '-loglevel', 'error', '-ss', (clip.offsetMs / 1000).toFixed(3), '-i', clip.path, '-frames:v', '1', '-q:v', '3', '-f', 'image2', '-c:v', 'mjpeg', 'pipe:1'],
+            { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 },
+            (error, stdout) => error ? reject(error) : resolve(stdout)));
+        return mediaManager.createMediaObject(jpeg, 'image/jpeg');
     }
 
     // --- Intercom: viewer mic → ffmpeg (AAC-LC 16 kHz) → worker → P2P talkback ---

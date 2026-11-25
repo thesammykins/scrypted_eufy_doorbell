@@ -304,6 +304,8 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
                     ScryptedInterface.MotionSensor,
                     ScryptedInterface.Online,
                     ScryptedInterface.VideoClips,
+                    // What Scrypted NVR needs to play an event (it seeks the recording to the event's time).
+                    ScryptedInterface.VideoRecorder,
                     ScryptedInterface.ObjectDetector,
                     ...(info.hasTalkback ? [ScryptedInterface.Intercom] : []),
                     // Battery is also what tells Rebroadcast not to prebuffer (keep the doorbell awake) by default.
