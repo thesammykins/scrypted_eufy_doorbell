@@ -1,9 +1,10 @@
 import { execFile } from 'child_process';
 
 // GPU first: lower latency and far less CPU than x264 at the same quality. Constant-quality rate control
-// with a ceiling, a keyframe every 2 s at 15 fps, no B-frames (they add a frame of delay).
-const NVENC = '-c:v h264_nvenc -preset p4 -tune ll -rc vbr -cq 21 -b:v 8M -maxrate 12M -bufsize 6M -g 30 -bf 0 -profile:v high -pix_fmt yuv420p';
-const X264 = '-c:v libx264 -preset veryfast -tune zerolatency -crf 20 -maxrate 10M -bufsize 5M -g 30 -bf 0 -profile:v high -pix_fmt yuv420p';
+// with a ceiling, a keyframe every second at 15 fps (a viewer joining waits for one), no B-frames (they add a frame
+// of delay).
+const NVENC = '-c:v h264_nvenc -preset p4 -tune ll -rc vbr -cq 21 -b:v 8M -maxrate 12M -bufsize 6M -g 15 -bf 0 -profile:v high -pix_fmt yuv420p';
+const X264 = '-c:v libx264 -preset veryfast -tune zerolatency -crf 20 -maxrate 10M -bufsize 5M -g 15 -bf 0 -profile:v high -pix_fmt yuv420p';
 
 let detected: Promise<string[]> | undefined;
 

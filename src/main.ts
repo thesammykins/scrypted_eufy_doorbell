@@ -17,6 +17,9 @@ import { WorkerHost } from './worker-host';
 
 const { deviceManager, endpointManager, mediaManager } = sdk;
 
+// How long a ring (or person) keeps the doorbell streaming with nobody watching.
+const WARM_HOLD_SECONDS = 25;
+
 const NOTIFICATION_STYLES: Record<number, string> = {
     1: 'Text Only',
     2: 'Included Thumbnail',
@@ -128,6 +131,12 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings,
                 }
             },
         },
+        warmOn: {
+            title: 'Start Stream On',
+            description: 'Starts the doorbell streaming as soon as this happens, so opening it from the notification is near-instant. Costs ~25 s of streaming per event.',
+            choices: ['Ring', 'Ring and person', 'Off'],
+            defaultValue: 'Ring',
+        },
         lowBatteryThreshold: {
             title: 'Low Battery Alert (%)',
             type: 'number',
@@ -228,6 +237,12 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings,
         return { ffmpegPath, encoderArgs: await h264EncoderArgs(ffmpegPath, this.storageSettings.values.h264EncoderArguments, this.console) };
     }
 
+    private warm(sn: string, reason: string) {
+        if (this.storageSettings.values.warmOn === 'Off')
+            return;
+        this.knownDoorbell(sn)?.warm(reason, WARM_HOLD_SECONDS).catch(e => this.console.warn(`warming on ${reason} failed: ${(e as Error).message}`));
+    }
+
     /** Events only reach doorbells Scrypted already knows about. */
     private knownDoorbell(sn: string) {
         return deviceManager.getNativeIds().includes(sn) ? this.getCamera(sn) : undefined;
@@ -273,9 +288,14 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings,
         w.on('ring', e => {
             this.archive.onRing(e.sn);
             this.knownDoorbell(e.sn)?.onRing();
+            this.warm(e.sn, 'ring');
         });
         w.on('motion', e => this.knownDoorbell(e.sn)?.onMotion());
-        w.on('detection', e => this.knownDoorbell(e.sn)?.onDetection(e.className, e.label));
+        w.on('detection', e => {
+            this.knownDoorbell(e.sn)?.onDetection(e.className, e.label);
+            if (e.className === 'person' && this.storageSettings.values.warmOn === 'Ring and person')
+                this.warm(e.sn, 'person');
+        });
         w.on('battery', e => {
             this.knownDoorbell(e.sn)?.onBattery(e.level);
             this.batteryAlerts.onLevel(e.sn, this.doorbells.get(e.sn)?.name ?? e.sn, e.level);

@@ -19,7 +19,9 @@ type Device = Awaited<ReturnType<EufyMega['getDevice']>>;
 
 const CONNECT_TIMEOUT_MS = 15_000;
 const FIRST_KEYFRAME_TIMEOUT_MS = 20_000;
-const AUDIO_SNIFF_MS = 1_500;
+// After the first keyframe, how long to wait for the first audio frame so its format can be declared. Audio
+// normally lands alongside video; a long wait here was pure added latency on every cold open.
+const AUDIO_SNIFF_MS = 300;
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
 
 let client: EufyMega | undefined;

@@ -1,3 +1,4 @@
+import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
 import sdk, {
     Battery, BinarySensor, Camera, FFmpegInput, Intercom, MediaObject, MotionSensor, ObjectDetectionTypes, ObjectDetector,
@@ -6,13 +7,13 @@ import sdk, {
 } from '@scrypted/sdk';
 import type { RecordingArchive } from './archive';
 import { LensView, viewFor } from './lenses';
-import { createFFmpegInput, H264Transcode, STREAM_VARIANTS, streamOptions, variantFor } from './media';
+import { createFFmpegInput, H264Transcode, killQuietly, STREAM_VARIANTS, streamOptions, variantFor } from './media';
 import type { DoorbellInfo, DetectionClass } from './protocol';
 import { cropStill, placeholderJpeg, ThumbnailStore } from './stills';
 import { startTalkbackEncoder, TalkbackEncoder } from './talkback';
 import type { WorkerHost } from './worker-host';
 
-const { mediaManager } = sdk;
+const { mediaManager, systemManager } = sdk;
 
 // HomeKit and Google treat the rising edge as the press/detection; drop back so the next one is a new edge.
 const RING_RESET_MS = 10_000;
@@ -45,6 +46,7 @@ export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Cam
     private motionReset?: NodeJS.Timeout;
     private intercom: IntercomState = { kind: 'idle' };
     private lastSnapshotSource?: string;
+    private warmers: ChildProcess[] = [];
 
     private readonly sn: string;
     private readonly view?: LensView;
@@ -110,6 +112,28 @@ export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Cam
             this.intercom.encoder.stop();
             this.intercom = { kind: 'idle' };
         }
+    }
+
+    /**
+     * Opens every rendition through Scrypted (so Rebroadcast's session, the encoder and the doorbell's pull are
+     * all running) and reads it for `seconds` with nobody watching. Opening the doorbell from the ring
+     * notification then joins a stream that is already up instead of paying the doorbell's wake-up and every
+     * stage's start-up. The doorbell is awake recording Eufy's own clip at this point anyway.
+     */
+    async warm(reason: string, seconds: number) {
+        if (this.warmers.some(cp => cp.exitCode === null))
+            return;
+        const started = Date.now();
+        const self = systemManager.getDeviceById<VideoCamera>(this.id);
+        const ffmpeg = await mediaManager.getFFmpegPath();
+        this.warmers = await Promise.all(STREAM_VARIANTS.map(async variant => {
+            const media = await self.getVideoStream({ id: variant.id });
+            const input = await mediaManager.convertMediaObjectToJSON<FFmpegInput>(media, ScryptedMimeTypes.FFmpegInput);
+            const cp = spawn(ffmpeg, ['-hide_banner', '-loglevel', 'error', ...(input.inputArguments || []), '-t', String(seconds), '-f', 'null', '-'], { stdio: 'ignore' });
+            setTimeout(() => killQuietly(cp), (seconds + 5) * 1000);
+            return cp;
+        }));
+        this.console.log(`warmed on ${reason} in ${Date.now() - started}ms; holding ${seconds}s`);
     }
 
     // --- VideoCamera: one P2P pull shared by every viewer, gone when the last viewer leaves ---

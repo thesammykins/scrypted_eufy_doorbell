@@ -9,6 +9,8 @@ import type { LiveStreamInfo } from './protocol';
 const LOW_LATENCY_INPUT = ['-fflags', '+nobuffer+genpts', '-flags', 'low_delay', '-probesize', '65536', '-analyzeduration', '0'];
 const RAW_INPUT = [...LOW_LATENCY_INPUT, '-thread_queue_size', '1024', '-use_wallclock_as_timestamps', '1'];
 
+const OUTPUT_FPS = 15;
+
 export interface H264Transcode {
     ffmpegPath: string;
     encoderArgs: string[];
@@ -117,7 +119,11 @@ export async function createFFmpegInput(info: LiveStreamInfo, console: Console, 
     ];
     const video = info.video.codec === 'h264' && !filters.length && !variant.baseline
         ? ['-c:v', 'copy']
-        : [...(filters.length ? ['-vf', filters.join(',')] : []), ...encoderFor(variant, transcode.encoderArgs)];
+        // A fixed output clock: frames are stamped on arrival, and a late joiner's replay of the frames since the
+        // last keyframe arrives as one burst. Left alone, that reads as a huge frame rate (NVENC then refuses the
+        // Baseline 4.1 level) and duplicate timestamps; at the doorbell's own 15 fps the burst collapses to its
+        // newest frame, which is also the fastest way to a current picture.
+        : [...(filters.length ? ['-vf', filters.join(',')] : []), ...encoderFor(variant, transcode.encoderArgs), '-r', String(OUTPUT_FPS)];
     // P2P delivers audio in bursts, so arrival stamps jitter. Re-stamp from the sample count (a steady clock),
     // anchored at the first frame's arrival time so it stays in step with the arrival-stamped video.
     // Never resample to fit the jitter: stretching to it is what made the audio warble.
@@ -140,6 +146,7 @@ export async function createFFmpegInput(info: LiveStreamInfo, console: Console, 
 }
 
 function serveOnce(encoder: ChildProcess, console: Console): Promise<{ url: string; done: Promise<void> }> {
+    const spawnedAt = Date.now();
     return new Promise((resolveListen, rejectListen) => {
         let finish!: () => void;
         const done = new Promise<void>(resolve => finish = resolve);
@@ -154,6 +161,7 @@ function serveOnce(encoder: ChildProcess, console: Console): Promise<{ url: stri
             server.close();
             socket.setNoDelay(true);
             socket.on('error', () => { });
+            encoder.stdout!.once('data', () => console.log(`muxer first output ${Date.now() - spawnedAt}ms after start`));
             encoder.stdout!.pipe(socket);
             socket.once('close', finish);
             encoder.once('exit', () => socket.end());
