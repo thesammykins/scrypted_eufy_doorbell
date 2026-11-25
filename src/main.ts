@@ -15,13 +15,19 @@ import { WorkerHost } from './worker-host';
 
 const { deviceManager, mediaManager } = sdk;
 
+const NOTIFICATION_STYLES: Record<number, string> = {
+    1: 'Text Only',
+    2: 'Included Thumbnail',
+    3: 'Text First, Then Thumbnail',
+};
+
 class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings {
     private readonly cameras = new Map<string, EufyDoorbell>();
     private readonly worker: WorkerHost;
     private readonly archive: RecordingArchive;
     private readonly thumbnails: ThumbnailStore;
     private readonly batteryAlerts: BatteryAlerts;
-    private readonly names = new Map<string, string>();
+    private readonly doorbells = new Map<string, DoorbellInfo>();
     private auth: AuthState = { kind: 'signedOut' };
 
     readonly storageSettings = new StorageSettings(this, {
@@ -92,6 +98,33 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
             type: 'number',
             defaultValue: 45,
             group: 'Recordings',
+        },
+        notificationStyle: {
+            title: 'Eufy Notification Style',
+            choices: Object.values(NOTIFICATION_STYLES),
+            noStore: true,
+            onGet: async () => {
+                const doorbell = this.doorbells.values().next().value;
+                const style = doorbell?.notificationStyle;
+                return {
+                    hide: style === undefined,
+                    defaultValue: style !== undefined ? NOTIFICATION_STYLES[style] : undefined,
+                    readonly: !doorbell?.notificationStyleWritable,
+                    description: doorbell?.notificationStyleWritable
+                        ? 'Text Only pushes carry no thumbnail or clip. Also changes the Eufy app\'s notifications.'
+                        : 'Change this in the Eufy app (doorbell > Notifications). Text Only pushes carry no thumbnail or clip, so snapshots and ring clips need a thumbnail style.',
+                };
+            },
+            onPut: (_: unknown, value: unknown) => {
+                const style = Number(Object.entries(NOTIFICATION_STYLES).find(([, name]) => name === value)?.[0]);
+                if (!style)
+                    return;
+                for (const info of [...this.doorbells.values()].filter(d => d.notificationStyleWritable)) {
+                    this.worker.call('setNotificationStyle', { sn: info.sn, style })
+                        .then(() => info.notificationStyle = style)
+                        .catch(e => this.console.error(`setting ${info.name} notification style failed`, e));
+                }
+            },
         },
         lowBatteryThreshold: {
             title: 'Low Battery Alert (%)',
@@ -235,9 +268,9 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
         w.on('detection', e => this.knownDoorbell(e.sn)?.onDetection(e.className, e.label));
         w.on('battery', e => {
             this.knownDoorbell(e.sn)?.onBattery(e.level);
-            this.batteryAlerts.onLevel(e.sn, this.names.get(e.sn) ?? e.sn, e.level);
+            this.batteryAlerts.onLevel(e.sn, this.doorbells.get(e.sn)?.name ?? e.sn, e.level);
         });
-        w.on('batteryAlert', e => this.batteryAlerts.onEufyAlert(this.names.get(e.sn) ?? e.sn, e.state));
+        w.on('batteryAlert', e => this.batteryAlerts.onEufyAlert(this.doorbells.get(e.sn)?.name ?? e.sn, e.state));
         w.on('recordingAvailable', e => this.archive.onRecordingAvailable(e));
         w.on('talkbackEnded', e => {
             for (const camera of this.cameras.values())
@@ -282,7 +315,7 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
         for (const info of doorbells) {
             this.console.log(`doorbell ${info.name} (${info.model}, ${info.sn}) battery=${info.hasBattery} talkback=${info.hasTalkback} view=${viewFor(info.sn)?.name ?? 'single lens'}`);
             this.getCamera(info.sn).update(info);
-            this.names.set(info.sn, info.name);
+            this.doorbells.set(info.sn, info);
             if (info.batteryLevel !== undefined)
                 this.batteryAlerts.onLevel(info.sn, info.name, info.batteryLevel);
         }

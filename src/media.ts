@@ -48,14 +48,17 @@ function maps(info: LiveStreamInfo) {
  * consumer (Rebroadcast). NUT carries codec headers, which RTSP needs and raw ADTS/Annex-B lack.
  * H.264 video is copied; H.265 is re-encoded because HomeKit and Google Home only take H.264, and a stacked
  * dual-lens frame is composed into its landscape view (which needs the encode anyway). Audio is
- * re-encoded (cheap at 16 kHz mono) so its arrival-stamped timestamps come out smooth and monotonic.
+ * re-encoded (cheap at 16 kHz mono) so it can be re-timed onto a steady clock.
  * Closing the socket kills the muxer, which closes the worker's sockets, which ends the P2P pull.
  */
 export async function createFFmpegInput(info: LiveStreamInfo, console: Console, transcode: H264Transcode, view?: LensView): Promise<FFmpegInput> {
     const video = info.video.codec === 'h264' && !view
         ? ['-c:v', 'copy']
         : [...(view ? ['-vf', view.filter] : []), ...transcode.encoderArgs];
-    const audio = info.audio ? ['-c:a', 'aac', '-b:a', '32k', '-af', 'aresample=async=1000'] : [];
+    // P2P delivers audio in bursts, so arrival stamps jitter. Re-stamp from the sample count (a steady clock),
+    // anchored at the first frame's arrival time so it stays in step with the arrival-stamped video.
+    // Never resample to fit the jitter: stretching to it is what made the audio warble.
+    const audio = info.audio ? ['-af', 'asetpts=N/SR/TB+STARTPTS', '-c:a', 'aac', '-b:a', '48k'] : [];
     const args = [
         '-hide_banner', '-loglevel', 'error',
         ...rawInputs(info), ...maps(info),

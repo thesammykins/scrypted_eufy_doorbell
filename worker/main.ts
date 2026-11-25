@@ -122,6 +122,12 @@ const handlers: { [M in keyof Methods]: (params: Methods[M][0]) => Promise<Metho
         return { jpegBase64: jpeg.toString('base64') };
     },
 
+    async setNotificationStyle({ sn, style }) {
+        await cameraOf(sn);
+        await requireClient().setProperty(sn, 'notificationStyle', style);
+        log.info(`doorbell ${sn} notification style set to ${style}`);
+    },
+
     async downloadRecording({ sn, recording, cipherId, outPath }) {
         const cam = await cameraOf(sn);
         if (!cam.downloadRecording)
@@ -196,11 +202,26 @@ async function publishDoorbells(eufy: EufyMega) {
             hasBattery: dev.has('battery'),
             hasTalkback: !!cam?.talkback,
             batteryLevel: batteryOf(dev),
+            ...notificationStyleOf(dev),
         });
         log.info(`doorbell ${dev.name} (${dev.sn}, ${dev.modelName}, station ${dev.stationSn}) capabilities: ${dev.capabilities.join(', ')}; live quality ${describeTier(dev.getProperty('streamingQuality'))}, recording quality ${describeTier(dev.getProperty('recordingQuality'))}`);
     }
     send({ event: 'doorbells', doorbells });
     markReady();
+}
+
+/**
+ * Battery doorbells keep the style that actually governs their pushes inside the `notificationMode` (1710)
+ * config, which has no verified write; others use `notificationStyle` (6020), which is writable.
+ */
+function notificationStyleOf(dev: Device): { notificationStyle?: number; notificationStyleWritable: boolean } {
+    // getProperty() leaves config-shaped values out; the raw record in getProperties() carries them.
+    const raw = dev.getProperties() as Record<string, { value?: unknown } | undefined>;
+    const mode = raw.notificationMode?.value as { notification_style?: unknown } | undefined;
+    if (mode && typeof mode === 'object' && typeof mode.notification_style === 'number')
+        return { notificationStyle: mode.notification_style, notificationStyleWritable: false };
+    const style = raw.notificationStyle?.value;
+    return { notificationStyle: typeof style === 'number' ? style : undefined, notificationStyleWritable: typeof style === 'number' };
 }
 
 function describeTier(value: unknown) {

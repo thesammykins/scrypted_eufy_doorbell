@@ -37,6 +37,10 @@ export interface DoorbellInfo {
     hasBattery: boolean;
     hasTalkback: boolean;
     batteryLevel?: number;
+    /** Eufy push style: 1 text only, 2 included thumbnail, 3 text first then thumbnail. */
+    notificationStyle?: number;
+    /** False on families (battery doorbells) whose style lives in a config the SDK has no verified write for. */
+    notificationStyleWritable: boolean;
 }
 
 export interface LiveStreamInfo {
@@ -60,6 +64,7 @@ export interface Methods {
     talkback: [{ sn: string }, TalkbackInfo];
     stopTalkback: [{ talkId: string }, void];
     snapshot: [{ sn: string }, { jpegBase64: string }];
+    setNotificationStyle: [{ sn: string; style: number }, void];
     /** Fetch the clip Eufy itself recorded on the HomeBase and mux it to MP4 at `outPath`. Never wakes the camera. */
     downloadRecording: [{ sn: string; recording: string; cipherId: number; outPath: string }, RecordingResult];
 }
