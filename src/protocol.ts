@@ -65,8 +65,20 @@ export interface Methods {
     stopTalkback: [{ talkId: string }, void];
     snapshot: [{ sn: string }, { jpegBase64: string }];
     setNotificationStyle: [{ sn: string; style: number }, void];
+    /** The doorbell's clips in the HomeBase's own index over the last `days` days, newest first. */
+    listRecordings: [{ sn: string; days: number }, RecordingEntry[]];
     /** Fetch the clip Eufy itself recorded on the HomeBase and mux it to MP4 at `outPath`. Never wakes the camera. */
     downloadRecording: [{ sn: string; recording: string; codec: VideoCodec; cipherId: number; outPath: string }, RecordingResult];
+}
+
+export interface RecordingEntry {
+    /** The station's file name without `.dat`, e.g. `h265_20261125201147`. */
+    recording: string;
+    codec: VideoCodec;
+    cipherId: number;
+    startMs: number;
+    durationMs: number;
+    isRing: boolean;
 }
 
 export interface RecordingResult {
@@ -95,8 +107,6 @@ export type WorkerEvent =
     | { event: 'detection'; sn: string; className: DetectionClass; label: string }
     | { event: 'battery'; sn: string; level: number }
     | { event: 'batteryAlert'; sn: string; state?: 'low' | 'hot' | 'full' }
-    /** An event push named a recording the HomeBase is storing. */
-    | { event: 'recordingAvailable'; sn: string; recording: string; codec: VideoCodec; cipherId: number; isRing: boolean; at: number }
     | { event: 'streamEnded'; streamId: string; reason: string }
     | { event: 'talkbackEnded'; talkId: string; reason: string }
     | { event: 'log'; level: 'debug' | 'info' | 'warn' | 'error'; message: string };

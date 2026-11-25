@@ -261,7 +261,7 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
         w.on('push', e => this.storageSettings.values.push = e.data ?? '');
         w.on('doorbells', e => this.discover(e.doorbells));
         w.on('ring', e => {
-            this.archive.noteRing(e.sn);
+            this.archive.onRing(e.sn);
             this.knownDoorbell(e.sn)?.onRing();
         });
         w.on('motion', e => this.knownDoorbell(e.sn)?.onMotion());
@@ -271,7 +271,6 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
             this.batteryAlerts.onLevel(e.sn, this.doorbells.get(e.sn)?.name ?? e.sn, e.level);
         });
         w.on('batteryAlert', e => this.batteryAlerts.onEufyAlert(this.doorbells.get(e.sn)?.name ?? e.sn, e.state));
-        w.on('recordingAvailable', e => this.archive.onRecordingAvailable(e));
         w.on('talkbackEnded', e => {
             for (const camera of this.cameras.values())
                 camera.onTalkbackEnded(e.talkId, e.reason);
@@ -319,7 +318,8 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
             if (info.batteryLevel !== undefined)
                 this.batteryAlerts.onLevel(info.sn, info.name, info.batteryLevel);
         }
-        this.archive.prune();
+        for (const info of doorbells)
+            this.archive.start(info.sn);
     }
 }
 

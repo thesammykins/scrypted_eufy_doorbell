@@ -96,6 +96,7 @@ export async function installWorker(volume: string, runtime: NodeRuntime, bundle
         console.log(stdout.trim());
     if (stderr.trim())
         console.warn(stderr.trim());
+    patchSdk(dir, console);
     fs.writeFileSync(entry, bundle.source);
     fs.writeFileSync(stamp, bundle.hash);
     return entry;
@@ -107,5 +108,30 @@ function readIf(file: string) {
     }
     catch {
         return undefined;
+    }
+}
+
+/**
+ * eufy-sdk 0.5.0 only accepts a bare 14-digit HomeBase recording name, but battery doorbells (T8213) store
+ * clips as `h265_<yyyyMMddHHmmss>.dat` (read from the HomeBase's own index), so every download was refused
+ * or asked for a file that does not exist. Widen that one check. Fails loudly if the SDK changes under it.
+ */
+const SDK_PATCHES = [{
+    file: 'node_modules/@mega-yfue/eufy-sdk/dist/index.js',
+    find: 'if (!/^\\d{14}$/.test(recording) ||',
+    replace: 'if (!/^(?:h26[45]_)?\\d{14}$/.test(recording) ||',
+}];
+
+function patchSdk(dir: string, console: Console) {
+    for (const patch of SDK_PATCHES) {
+        const file = path.join(dir, patch.file);
+        const source = fs.readFileSync(file, 'utf8');
+        if (source.includes(patch.replace))
+            continue;
+        const count = source.split(patch.find).length - 1;
+        if (count !== 1)
+            throw new Error(`eufy-sdk patch target found ${count} times in ${patch.file}; the pinned SDK version changed`);
+        fs.writeFileSync(file, source.replace(patch.find, patch.replace));
+        console.log(`patched ${patch.file}: HomeBase recording names may carry a codec prefix`);
     }
 }

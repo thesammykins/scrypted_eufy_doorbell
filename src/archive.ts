@@ -3,60 +3,65 @@ import fs from 'fs';
 import path from 'path';
 import { promisify } from 'util';
 import type { VideoClip, VideoClipOptions } from '@scrypted/sdk';
-import type { WorkerEvent } from './protocol';
+import type { RecordingEntry } from './protocol';
 import type { WorkerHost } from './worker-host';
 
 const execFileAsync = promisify(execFile);
 
-type RecordingAvailable = Extract<WorkerEvent, { event: 'recordingAvailable' }>;
 export type ClipKind = 'ring' | 'motion';
 
 export interface ArchivePolicy {
     archiveMotion(): boolean;
     retentionDays(): number;
-    /** Seconds to wait after the push before downloading: Eufy must have finished writing the clip. */
+    /** Seconds to wait after a ring before syncing: Eufy must have finished writing the clip. */
     downloadDelaySeconds(): number;
     ffmpegPath(): Promise<string>;
 }
 
-// A ring push and the recording push for the same press arrive within seconds of each other.
-const RING_CORRELATION_MS = 60_000;
-const RETRY_DELAYS_S = [30, 90];
-const SEEN_LIMIT = 500;
+// A second pass after a ring catches a clip that was still being written on the first.
+const SECOND_PASS_S = 120;
+const PERIODIC_SYNC_MS = 30 * 60 * 1000;
+const LOOKBACK_DAYS = 2;
 
 /**
  * Keeps a copy of the clip Eufy records on the HomeBase for each ring (and optionally motion): full
- * resolution, both lenses, exactly what the Eufy app would show, fetched from the HomeBase's storage so the
- * doorbell is never woken for it. Stored as `<volume>/recordings/<sn>/<startMs>-<kind>.mp4` + `.jpg`.
+ * resolution, both lenses, exactly what the Eufy app shows. It syncs against the HomeBase's own clip index
+ * rather than trusting push payloads, so a restart, a missed push or an earlier ring is caught up on the next
+ * pass. Nothing here wakes the doorbell: the index and the clips live on the wired HomeBase.
+ *
+ * Stored as `<volume>/recordings/<sn>/<startMs>-<kind>.mp4` + `.jpg` + `.json`.
  */
 export class RecordingArchive {
     private readonly root: string;
-    private readonly lastRing = new Map<string, number>();
-    private readonly seen = new Set<string>();
+    private readonly syncing = new Map<string, Promise<void>>();
+    private readonly started = new Set<string>();
 
     constructor(volume: string, private readonly worker: WorkerHost, private readonly policy: ArchivePolicy, private readonly console: Console) {
         this.root = path.join(volume, 'recordings');
         fs.mkdirSync(this.root, { recursive: true });
     }
 
-    noteRing(sn: string) {
-        this.lastRing.set(sn, Date.now());
+    /** Sync now and every 30 minutes from here on (once per doorbell, however often it is rediscovered). */
+    start(sn: string) {
+        if (this.started.has(sn))
+            return;
+        this.started.add(sn);
+        this.sync(sn, 'startup');
+        setInterval(() => this.sync(sn, 'periodic'), PERIODIC_SYNC_MS);
     }
 
-    onRecordingAvailable(e: RecordingAvailable) {
-        if (this.seen.has(e.recording))
-            return; // one event usually arrives as several pushes
-        const kind = this.classify(e);
-        if (kind === 'motion' && !this.policy.archiveMotion())
-            return;
-        this.seen.add(e.recording);
-        if (this.seen.size > SEEN_LIMIT)
-            this.seen.delete(this.seen.values().next().value!);
-
-        const outPath = path.join(this.root, e.sn, `${e.at}-${kind}.mp4`);
+    onRing(sn: string) {
         const delay = this.policy.downloadDelaySeconds();
-        this.console.log(`${kind} recording ${e.recording} on ${e.sn}: downloading from the HomeBase in ${delay}s`);
-        setTimeout(() => this.download(e, outPath, 0), delay * 1000);
+        setTimeout(() => this.sync(sn, 'ring'), delay * 1000);
+        setTimeout(() => this.sync(sn, 'ring (second pass)'), (delay + SECOND_PASS_S) * 1000);
+    }
+
+    /** One sync per doorbell at a time; a request during a running sync waits for it then runs again. */
+    sync(sn: string, reason: string): Promise<void> {
+        const previous = this.syncing.get(sn) ?? Promise.resolve();
+        const next = previous.then(() => this.syncOnce(sn, reason)).catch(e => this.console.warn(`clip sync (${reason}) failed: ${(e as Error).message}`));
+        this.syncing.set(sn, next);
+        return next;
     }
 
     list(sn: string, options?: VideoClipOptions): VideoClip[] {
@@ -109,38 +114,44 @@ export class RecordingArchive {
                 fs.rmSync(this.resolve(id, ext), { force: true });
     }
 
-    prune() {
+    private async syncOnce(sn: string, reason: string) {
         const cutoff = Date.now() - this.policy.retentionDays() * 24 * 60 * 60 * 1000;
-        for (const sn of fs.readdirSync(this.root)) {
-            const old = this.list(sn).filter(c => c.startTime < cutoff).map(c => c.id);
-            if (old.length) {
-                this.console.log(`pruning ${old.length} archived clips older than ${this.policy.retentionDays()} days for ${sn}`);
-                this.remove(old);
-            }
-        }
+        const entries = await this.worker.call('listRecordings', { sn, days: LOOKBACK_DAYS });
+        const wanted = entries.filter(e => (e.isRing || this.policy.archiveMotion()) && e.startMs >= cutoff);
+        const missing = wanted.filter(e => !fs.existsSync(this.pathFor(sn, e)));
+        this.console.log(`clip sync (${reason}): HomeBase has ${entries.length} clips, ${wanted.filter(e => e.isRing).length} rings; ${missing.length} to fetch`);
+        for (const entry of missing)
+            await this.download(sn, entry);
+        this.prune(sn, cutoff);
     }
 
-    private classify(e: RecordingAvailable): ClipKind {
-        if (e.isRing)
-            return 'ring';
-        const rang = this.lastRing.get(e.sn);
-        return rang && Math.abs(e.at - rang) < RING_CORRELATION_MS ? 'ring' : 'motion';
+    private pathFor(sn: string, e: RecordingEntry) {
+        return path.join(this.root, sn, `${e.startMs}-${e.isRing ? 'ring' : 'motion'}.mp4`);
     }
 
-    private async download(e: RecordingAvailable, outPath: string, attempt: number) {
+    private async download(sn: string, entry: RecordingEntry) {
+        const outPath = this.pathFor(sn, entry);
+        const partial = `${outPath}.part.mp4`;
         const started = Date.now();
         try {
-            const result = await this.worker.call('downloadRecording', { sn: e.sn, recording: e.recording, codec: e.codec, cipherId: e.cipherId, outPath });
-            fs.writeFileSync(outPath.replace(/\.mp4$/, '.json'), JSON.stringify({ recording: e.recording, ...result }));
+            const result = await this.worker.call('downloadRecording', { sn, recording: entry.recording, codec: entry.codec, cipherId: entry.cipherId, outPath: partial });
+            fs.renameSync(partial, outPath);
+            fs.writeFileSync(outPath.replace(/\.mp4$/, '.json'), JSON.stringify({ recording: entry.recording, codec: entry.codec, ...result }));
             await this.writeThumbnail(outPath);
-            this.console.log(`archived ${path.basename(outPath)} (${Math.round(result.durationMs / 1000)}s, ${result.fps}fps, audio ${result.hasAudio}) in ${Date.now() - started}ms`);
-            this.prune();
+            this.console.log(`archived ${entry.isRing ? 'ring' : 'motion'} clip ${entry.recording} (${Math.round(result.durationMs / 1000)}s, ${result.fps}fps, audio ${result.hasAudio}) in ${Date.now() - started}ms`);
         }
         catch (err) {
-            const retryIn = RETRY_DELAYS_S[attempt];
-            this.console.warn(`recording ${e.recording} download failed (attempt ${attempt + 1}): ${(err as Error).message}${retryIn ? `; retrying in ${retryIn}s` : '; giving up'}`);
-            if (retryIn)
-                setTimeout(() => this.download(e, outPath, attempt + 1), retryIn * 1000);
+            fs.rmSync(partial, { force: true });
+            // Left missing on purpose: the next sync retries it.
+            this.console.warn(`clip ${entry.recording} not archived yet: ${(err as Error).message}`);
+        }
+    }
+
+    private prune(sn: string, cutoff: number) {
+        const old = this.list(sn).filter(c => c.startTime < cutoff).map(c => c.id);
+        if (old.length) {
+            this.console.log(`pruning ${old.length} archived clips older than ${this.policy.retentionDays()} days for ${sn}`);
+            this.remove(old);
         }
     }
 

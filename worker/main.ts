@@ -10,9 +10,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import { EufyMega, LoginStatus, type LiveStreamConsumer, type TalkbackHandle } from '@mega-yfue/eufy-sdk';
+import { EufyMega, LoginStatus, RecordingDownloadError, type LiveStreamConsumer, type TalkbackHandle } from '@mega-yfue/eufy-sdk';
 import type {
-    AudioFormat, AuthState, DetectionClass, DoorbellInfo, LiveStreamInfo, Methods, Request, Response, TalkbackInfo, VideoCodec, WorkerConfig, WorkerEvent,
+    AudioFormat, AuthState, DetectionClass, RecordingEntry, DoorbellInfo, LiveStreamInfo, Methods, Request, Response, TalkbackInfo, VideoCodec, WorkerConfig, WorkerEvent,
 } from '../src/protocol.js';
 
 type Device = Awaited<ReturnType<EufyMega['getDevice']>>;
@@ -128,18 +128,25 @@ const handlers: { [M in keyof Methods]: (params: Methods[M][0]) => Promise<Metho
         log.info(`doorbell ${sn} notification style set to ${style}`);
     },
 
+    async listRecordings({ sn, days }) {
+        return listRecordings(sn, days);
+    },
+
     async downloadRecording({ sn, recording, codec, cipherId, outPath }) {
         const cam = await cameraOf(sn);
         if (!cam.downloadRecording)
             throw new Error('this camera\'s station does not support recording download (HomeBase 2 only)');
         const started = Date.now();
-        const resolved = await resolveRecording(sn, recording).catch(e => {
-            log.warn(`recording index lookup failed for ${sn}: ${e instanceof Error ? e.message : e}; using the push's name`);
-            return undefined;
+        const download = cam.downloadRecording.bind(cam);
+        // The HomeBase index reports the key id with flag bits set (134217871 = 0x0800008F); the cloud knows it
+        // by the bare id (143, what pushes carry). Try as given, then bare.
+        const bare = cipherId & 0xffffff;
+        const clip = await download({ recording, cipherId, timeoutMs: 120_000 }).catch(e => {
+            if (bare === cipherId || !(e instanceof RecordingDownloadError) || e.reason !== 'key-unavailable')
+                throw e;
+            log.debug(`recording ${recording}: key ${cipherId} unavailable, retrying as ${bare}`);
+            return download({ recording, cipherId: bare, timeoutMs: 120_000 });
         });
-        if (resolved && (resolved.recording !== recording || resolved.cipherId !== cipherId))
-            log.info(`recording ${recording} is stored on the HomeBase as ${resolved.recording} (cipher ${resolved.cipherId})`);
-        const clip = await cam.downloadRecording({ recording: resolved?.recording ?? recording, cipherId: resolved?.cipherId ?? cipherId, timeoutMs: 120_000 });
         log.info(`recording ${recording} downloaded in ${Date.now() - started}ms: ${clip.durationMs}ms @ ${clip.fps}fps, ${clip.video.length} bytes video, missing ${clip.missingFrames} frames`);
         await muxRecording(clip.video, codec, clip.audio, clip.fps, outPath);
         return { durationMs: clip.durationMs, fps: clip.fps, missingFrames: clip.missingFrames, hasAudio: !!clip.audio?.length };
@@ -148,48 +155,71 @@ const handlers: { [M in keyof Methods]: (params: Methods[M][0]) => Promise<Metho
 
 const execFileAsync = promisify(execFile);
 
-const RECORDING_MATCH_WINDOW_S = 120;
+// Observed on a T8213: every doorbell-press clip carries trigger_type 128.
+const RING_TRIGGER_TYPE = 128;
 
 /**
- * The push names a clip by the ring time, which need not be the file the HomeBase wrote (it can start a
- * few seconds earlier or later). Ask the HomeBase's own recording index (`history_record_info`) for this
- * doorbell's clips that day and take the one starting nearest the push's time.
+ * The doorbell's clips from the HomeBase's own index (`history_record_info`), newest first. This is the
+ * source of truth for file names and keys: a push's `file_path` and `cipher` are close but not what the
+ * station serves (the key is the full 32-bit id, the push carries its low byte). Reading the index happens on
+ * the wired HomeBase and never wakes the doorbell.
  */
-async function resolveRecording(sn: string, pushName: string): Promise<{ recording: string; cipherId: number } | undefined> {
+async function listRecordings(sn: string, days: number): Promise<RecordingEntry[]> {
     const eufy = requireClient();
-    const dev = devices.get(sn);
+    const dev = devices.get(sn) ?? (await cameraOf(sn), devices.get(sn));
     if (!dev)
-        return undefined;
+        return [];
     const station = dev.stationSn;
     // Private on EufyMega, but it is the only source of the account id the station's database requires.
     const accountId = (eufy as unknown as { adminUserIdOf(sn: string): string | undefined }).adminUserIdOf(station);
     const session = eufy.getP2pSessions().get(station);
     if (!accountId || !session)
         throw new Error(`no ${!accountId ? 'admin account id' : 'P2P session'} for station ${station}`);
-    const day = pushName.slice(0, 8);
-    const rows = await session.queryRecordPage({ accountId, startDate: day, endDate: day, startTime: '0', count: 20 });
-    log.debug(`HomeBase index raw reply (${rows.length} groups): ${safeJson(rows).slice(0, 3000)}`);
-    const records = collectRecords(rows).filter(r => !r.device_sn || r.device_sn === sn);
-    log.debug(`HomeBase index for ${sn} on ${day}: ${safeJson(records.slice(0, 5))}`);
-    const target = toEpochSeconds(pushName);
-    let best: { recording: string; cipherId: number; distance: number } | undefined;
-    for (const r of records) {
-        const name = /(\d{14})\.dat$/.exec(String(r.storage_path ?? ''))?.[1];
-        if (!name || typeof r.cipher_id !== 'number')
+    // Dates are station-local; the end date is exclusive.
+    const rows = await session.queryRecordPage({ accountId, startDate: localDate(-days), endDate: localDate(1), startTime: '0', count: 100 });
+    const entries: RecordingEntry[] = [];
+    for (const r of collectRecords(rows)) {
+        if (r.device_sn && r.device_sn !== sn)
             continue;
-        const distance = Math.abs(toEpochSeconds(name) - target);
-        if (distance <= RECORDING_MATCH_WINDOW_S && (!best || distance < best.distance))
-            best = { recording: name, cipherId: r.cipher_id, distance };
+        // e.g. /media/mmcblk0p1/Camera03/h265_20261125201147.dat; the file name (sans .dat) is what the station serves.
+        const match = /((?:(h26[45])_)?(\d{14}))\.dat$/.exec(String(r.storage_path ?? ''));
+        if (!match || typeof r.cipher_id !== 'number')
+            continue;
+        const startMs = localNameToEpochMs(match[3]);
+        const endMs = typeof r.end_time === 'string' ? localNameToEpochMs(r.end_time.replace(/\D/g, '')) : startMs;
+        entries.push({
+            recording: match[1],
+            codec: match[2] === 'h265' ? 'h265' : 'h264',
+            cipherId: r.cipher_id,
+            startMs,
+            durationMs: Math.max(0, endMs - startMs),
+            isRing: r.trigger_type === RING_TRIGGER_TYPE,
+        });
     }
-    log.info(`HomeBase index for ${sn} on ${day}: ${records.length} clips; nearest to ${pushName}: ${best ? `${best.recording} (${best.distance}s away)` : 'none'}`);
-    return best && { recording: best.recording, cipherId: best.cipherId };
+    entries.sort((x, y) => y.startMs - x.startMs);
+    log.debug(`HomeBase index for ${sn}: ${entries.length} clips, triggers ${safeJson(collectRecords(rows).map(r => r.trigger_type))}`);
+    return entries;
+}
+
+/** Station-local yyyyMMdd, `offsetDays` from today. The worker runs in the server's TZ, the same as the HomeBase's. */
+function localDate(offsetDays: number) {
+    const d = new Date();
+    d.setDate(d.getDate() + offsetDays);
+    return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** yyyyMMddHHmmss in station-local time → epoch ms (via the worker's TZ, which matches the HomeBase's). */
+function localNameToEpochMs(name: string) {
+    const [y, mo, d, h, mi, se] = [0, 4, 6, 8, 10, 12].map((i, k) => Number(name.slice(i, i + (k === 0 ? 4 : 2))));
+    return new Date(y, mo - 1, d, h, mi, se).getTime();
 }
 
 interface RecordRow {
     device_sn?: string;
     storage_path?: unknown;
     cipher_id?: unknown;
-    start_time?: unknown;
+    end_time?: unknown;
+    trigger_type?: unknown;
 }
 
 /** The reply groups each recording row with companion tables; walk it and keep the rows that look like recordings. */
@@ -215,12 +245,6 @@ function collectRecords(value: unknown, out: RecordRow[] = []): RecordRow[] {
                 collectRecords(v, out);
     }
     return out;
-}
-
-/** yyyyMMddHHmmss (station-local) → seconds, only ever compared against another name in the same zone. */
-function toEpochSeconds(name: string) {
-    const [y, mo, d, h, mi, se] = [0, 4, 6, 8, 10, 12].map((i, k) => Number(name.slice(i, i + (k === 0 ? 4 : 2))));
-    return Date.UTC(y, mo - 1, d, h, mi, se) / 1000;
 }
 
 /** Elementary video + ADTS AAC from the HomeBase → MP4, stream-copied (the archive keeps full resolution). */
@@ -290,11 +314,6 @@ async function publishDoorbells(eufy: EufyMega) {
     }
     send({ event: 'doorbells', doorbells });
     markReady();
-    if (debug) {
-        const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-        for (const sn of devices.keys())
-            resolveRecording(sn, `${today}000000`).catch(e => log.debug(`index probe for ${sn} failed: ${e instanceof Error ? e.message : e}`));
-    }
 }
 
 /**
@@ -340,32 +359,8 @@ function wireEvents(eufy: EufyMega) {
         if (level !== undefined && /battery/i.test(e.property))
             send({ event: 'battery', sn: e.deviceSn, level });
     });
-    eufy.on('push', ev => {
-        log.debug(`push ${ev.eventName ?? '?'} type ${ev.eventType ?? '?'} device ${ev.deviceSn ?? '?'} cipher ${ev.cipher ?? '-'} payload ${safeJson(ev.payload)}`);
-        const ref = recordingRef(ev.payload as { p?: unknown; file_path?: unknown } | undefined);
-        if (ev.deviceSn && devices.has(ev.deviceSn) && ref && ev.cipher !== undefined) {
-            const isRing = ev.eventType === RING_EVENT_TYPE || /doorbell|ring/i.test(ev.eventName ?? '');
-            log.info(`push ${ev.eventName ?? ev.eventType} for ${ev.deviceSn} names recording ${ref.recording} (${ref.codec})`);
-            send({ event: 'recordingAvailable', sn: ev.deviceSn, ...ref, cipherId: ev.cipher, isRing, at: Date.now() });
-        }
-    });
     eufy.on('sessionExpired', () => setAuth({ kind: 'failed', message: 'Eufy session expired or was replaced; sign in again' }));
     eufy.on('error', (e: unknown) => log.error('eufy error', e));
-}
-
-const RING_EVENT_TYPE = 3103;
-
-/**
- * The HomeBase names a recording by its 14-digit start time. Pushes carry it as `p` on some families and as
- * `file_path` with a codec prefix (`h265_20261125200313`) on battery doorbells.
- */
-function recordingRef(payload: { p?: unknown; file_path?: unknown } | undefined): { recording: string; codec: VideoCodec } | undefined {
-    for (const value of [payload?.p, payload?.file_path]) {
-        const match = typeof value === 'string' ? /^(?:(h26[45])_)?(\d{14})$/.exec(value) : null;
-        if (match)
-            return { recording: match[2], codec: match[1] === 'h265' ? 'h265' : 'h264' };
-    }
-    return undefined;
 }
 
 function requireClient() {
