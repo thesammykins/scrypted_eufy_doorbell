@@ -66,7 +66,7 @@ export interface Methods {
     snapshot: [{ sn: string }, { jpegBase64: string }];
     setNotificationStyle: [{ sn: string; style: number }, void];
     /** Fetch the clip Eufy itself recorded on the HomeBase and mux it to MP4 at `outPath`. Never wakes the camera. */
-    downloadRecording: [{ sn: string; recording: string; cipherId: number; outPath: string }, RecordingResult];
+    downloadRecording: [{ sn: string; recording: string; codec: VideoCodec; cipherId: number; outPath: string }, RecordingResult];
 }
 
 export interface RecordingResult {
@@ -95,8 +95,8 @@ export type WorkerEvent =
     | { event: 'detection'; sn: string; className: DetectionClass; label: string }
     | { event: 'battery'; sn: string; level: number }
     | { event: 'batteryAlert'; sn: string; state?: 'low' | 'hot' | 'full' }
-    /** An event push named a recording the HomeBase is storing; `eventName` is the SDK's semantic name. */
-    | { event: 'recordingAvailable'; sn: string; recording: string; cipherId: number; eventName?: string; at: number }
+    /** An event push named a recording the HomeBase is storing. */
+    | { event: 'recordingAvailable'; sn: string; recording: string; codec: VideoCodec; cipherId: number; isRing: boolean; at: number }
     | { event: 'streamEnded'; streamId: string; reason: string }
     | { event: 'talkbackEnded'; talkId: string; reason: string }
     | { event: 'log'; level: 'debug' | 'info' | 'warn' | 'error'; message: string };

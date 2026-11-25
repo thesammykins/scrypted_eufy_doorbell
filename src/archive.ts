@@ -121,7 +121,7 @@ export class RecordingArchive {
     }
 
     private classify(e: RecordingAvailable): ClipKind {
-        if (e.eventName === 'doorbellPress')
+        if (e.isRing)
             return 'ring';
         const rang = this.lastRing.get(e.sn);
         return rang && Math.abs(e.at - rang) < RING_CORRELATION_MS ? 'ring' : 'motion';
@@ -130,7 +130,7 @@ export class RecordingArchive {
     private async download(e: RecordingAvailable, outPath: string, attempt: number) {
         const started = Date.now();
         try {
-            const result = await this.worker.call('downloadRecording', { sn: e.sn, recording: e.recording, cipherId: e.cipherId, outPath });
+            const result = await this.worker.call('downloadRecording', { sn: e.sn, recording: e.recording, codec: e.codec, cipherId: e.cipherId, outPath });
             fs.writeFileSync(outPath.replace(/\.mp4$/, '.json'), JSON.stringify({ recording: e.recording, ...result }));
             await this.writeThumbnail(outPath);
             this.console.log(`archived ${path.basename(outPath)} (${Math.round(result.durationMs / 1000)}s, ${result.fps}fps, audio ${result.hasAudio}) in ${Date.now() - started}ms`);
