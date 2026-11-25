@@ -1,7 +1,7 @@
 {
   "name": "@thesammykins/scrypted-eufy-doorbell",
   "version": "0.1.0",
-  "description": "On-demand Eufy doorbell and camera streams, ring events and two-way audio for Scrypted.",
+  "description": "Eufy battery doorbells in Scrypted: on-demand P2P live view, ring and detection events, two-way audio and ring clips copied off the HomeBase.",
   "license": "MIT",
   "keywords": [
     "scrypted",
@@ -12,7 +12,7 @@
   "scripts": {
     "build": "node scripts/build-worker.mjs && scrypted-webpack",
     "typecheck": "node scripts/build-worker.mjs && tsc --noEmit && tsc -p worker/tsconfig.json",
-    "deploy": "npm run build && scrypted-deploy 192.168.88.220",
+    "deploy": "npm run build && scrypted-deploy ${SCRYPTED_HOST:?set SCRYPTED_HOST to your Scrypted server}",
     "console": "scripts/console.sh"
   },
   "scrypted": {
@@ -40,5 +40,9 @@
     "dependencies": {
       "@mega-yfue/eufy-sdk": "0.5.0"
     }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thesammykins/scrypted_eufy_doorbell.git"
   }
 }

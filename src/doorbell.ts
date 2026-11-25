@@ -16,7 +16,9 @@ const { mediaManager } = sdk;
 
 // HomeKit and Google treat the rising edge as the press/detection; drop back so the next one is a new edge.
 const RING_RESET_MS = 10_000;
-const MOTION_RESET_MS = 20_000;
+// HomeKit Secure Video records for as long as motion reads true, streaming live from the doorbell the whole
+// time. Eufy's own clips run 7-15 s, so hold motion about that long rather than keeping the doorbell awake.
+const MOTION_RESET_MS = 10_000;
 // Eufy fetches the event thumbnail a few seconds after the push; pick it up and keep it on disk.
 const THUMBNAIL_CAPTURE_DELAYS_MS = [4_000, 12_000];
 

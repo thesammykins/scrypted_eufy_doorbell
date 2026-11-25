@@ -621,11 +621,13 @@ async function startTalkback(sn: string): Promise<TalkbackInfo> {
         talkbacks.delete(talkId);
         server.close();
         socket?.destroy();
+        jitter.close();
         await talk.stop().catch(() => { });
         keepAwake.stop();
-        log.info(`talkback ${sn} ended: ${reason}`);
+        log.info(`talkback ${sn} ended: ${reason} (${jitter.stats()})`);
         send({ event: 'talkbackEnded', talkId, reason });
     };
+    let jitter = new JitterGate(() => { }, () => 0);
     talkbacks.set(talkId, () => stop('stopped by plugin'));
     talk.on('error', err => log.warn(`talkback ${sn}: ${err.message}`));
     talk.on('finished', () => stop('input finished'));
@@ -637,7 +639,13 @@ async function startTalkback(sn: string): Promise<TalkbackInfo> {
         socket = s;
         s.setNoDelay(true);
         s.on('error', e => log.debug(`talkback socket: ${e.message}`));
-        s.pipe(talk.writable());
+        const sink = talk.writable();
+        s.on('data', (chunk: Buffer) => jitter.push(chunk));
+        s.once('end', () => {
+            jitter.flush();
+            sink.end();
+        });
+        jitter = new JitterGate(chunk => sink.write(chunk), () => talk.pending);
     });
     const url = await new Promise<string>((resolve, reject) => {
         server.once('error', reject);
@@ -645,6 +653,67 @@ async function startTalkback(sn: string): Promise<TalkbackInfo> {
     });
     log.info(`talkback ${sn} open (speaker codec ${talk.codec})`);
     return { talkId, url };
+}
+
+// The SDK paces talkback frames out at exactly realtime with nothing in reserve, so a mic packet that arrives
+// a little late (network jitter on the viewer's side) leaves the doorbell with a gap: audible sputter. Hold this
+// much audio before releasing it, at the start and again whenever the SDK's queue runs dry, so it always has a
+// few frames in hand. 4 AAC frames at 16 kHz.
+const TALKBACK_CUSHION_MS = 256;
+
+class JitterGate {
+    private held: Buffer[] = [];
+    private timer?: NodeJS.Timeout;
+    private underruns = 0;
+    private chunks = 0;
+    private closed = false;
+
+    constructor(private readonly write: (chunk: Buffer) => void, private readonly pending: () => number) {
+    }
+
+    push(chunk: Buffer) {
+        if (this.closed)
+            return;
+        this.chunks++;
+        if (this.held.length || this.timer) {
+            this.held.push(chunk);
+            return;
+        }
+        if (this.chunks > 1 && this.pending() === 0) {
+            // Ran dry since the last chunk: the cushion is gone, rebuild it.
+            this.underruns++;
+            this.prime(chunk);
+            return;
+        }
+        if (this.chunks === 1) {
+            this.prime(chunk);
+            return;
+        }
+        this.write(chunk);
+    }
+
+    flush() {
+        clearTimeout(this.timer);
+        this.timer = undefined;
+        for (const chunk of this.held)
+            this.write(chunk);
+        this.held = [];
+    }
+
+    close() {
+        this.closed = true;
+        clearTimeout(this.timer);
+        this.held = [];
+    }
+
+    stats() {
+        return `${this.chunks} chunks, ${this.underruns} underruns`;
+    }
+
+    private prime(chunk: Buffer) {
+        this.held.push(chunk);
+        this.timer = setTimeout(() => this.flush(), TALKBACK_CUSHION_MS);
+    }
 }
 
 // --- lifecycle ---
