@@ -655,48 +655,41 @@ async function startTalkback(sn: string): Promise<TalkbackInfo> {
     return { talkId, url };
 }
 
-// The SDK paces talkback frames out at exactly realtime with nothing in reserve, so a mic packet that arrives
-// a little late (network jitter on the viewer's side) leaves the doorbell with a gap: audible sputter. Hold this
-// much audio before releasing it, at the start and again whenever the SDK's queue runs dry, so it always has a
-// few frames in hand. 4 AAC frames at 16 kHz.
-const TALKBACK_CUSHION_MS = 256;
+// The SDK paces talkback frames out at exactly realtime and never drops one. Two consequences for a live mic:
+// a late packet leaves the doorbell with a gap (sputter), and a source running even slightly fast builds a
+// backlog that only grows (delay). So keep a small reserve, rebuilt whenever the queue runs dry, and refuse to
+// let the queue grow past a ceiling by dropping incoming frames. Works on whole ADTS frames (64 ms each).
+const TALKBACK_PRIME_FRAMES = 4;      // ~256 ms reserve
+const TALKBACK_PRIME_MAX_MS = 300;    // don't wait longer than this to fill it
+const TALKBACK_MAX_QUEUED_FRAMES = 8; // ~512 ms ceiling on added delay
 
 class JitterGate {
+    private partial = Buffer.alloc(0);
     private held: Buffer[] = [];
     private timer?: NodeJS.Timeout;
+    private priming = true;
+    private framesIn = 0;
+    private dropped = 0;
     private underruns = 0;
-    private chunks = 0;
+    private maxQueued = 0;
     private closed = false;
 
-    constructor(private readonly write: (chunk: Buffer) => void, private readonly pending: () => number) {
+    constructor(private readonly write: (frame: Buffer) => void, private readonly pending: () => number) {
     }
 
     push(chunk: Buffer) {
         if (this.closed)
             return;
-        this.chunks++;
-        if (this.held.length || this.timer) {
-            this.held.push(chunk);
-            return;
-        }
-        if (this.chunks > 1 && this.pending() === 0) {
-            // Ran dry since the last chunk: the cushion is gone, rebuild it.
-            this.underruns++;
-            this.prime(chunk);
-            return;
-        }
-        if (this.chunks === 1) {
-            this.prime(chunk);
-            return;
-        }
-        this.write(chunk);
+        for (const frame of this.frames(chunk))
+            this.onFrame(frame);
     }
 
     flush() {
         clearTimeout(this.timer);
         this.timer = undefined;
-        for (const chunk of this.held)
-            this.write(chunk);
+        this.priming = false;
+        for (const frame of this.held)
+            this.write(frame);
         this.held = [];
     }
 
@@ -707,12 +700,53 @@ class JitterGate {
     }
 
     stats() {
-        return `${this.chunks} chunks, ${this.underruns} underruns`;
+        return `${this.framesIn} frames in, ${this.dropped} dropped to cap delay, ${this.underruns} underruns, max ${this.maxQueued} queued (${this.maxQueued * 64} ms)`;
     }
 
-    private prime(chunk: Buffer) {
-        this.held.push(chunk);
-        this.timer = setTimeout(() => this.flush(), TALKBACK_CUSHION_MS);
+    private onFrame(frame: Buffer) {
+        this.framesIn++;
+        if (!this.priming) {
+            const queued = this.pending();
+            this.maxQueued = Math.max(this.maxQueued, queued);
+            if (queued >= TALKBACK_MAX_QUEUED_FRAMES) {
+                this.dropped++;
+                return;
+            }
+            if (queued > 0) {
+                this.write(frame);
+                return;
+            }
+            // Ran dry: the reserve is gone, rebuild it before sending more.
+            this.underruns++;
+            this.priming = true;
+        }
+        this.held.push(frame);
+        if (this.held.length >= TALKBACK_PRIME_FRAMES)
+            this.flush();
+        else
+            this.timer ??= setTimeout(() => this.flush(), TALKBACK_PRIME_MAX_MS);
+    }
+
+    /** Split an AAC ADTS byte stream into whole frames, carrying any partial frame to the next chunk. */
+    private *frames(chunk: Buffer): Generator<Buffer> {
+        let buf = this.partial.length ? Buffer.concat([this.partial, chunk]) : chunk;
+        let offset = 0;
+        while (buf.length - offset >= 7) {
+            if (buf[offset] !== 0xff || (buf[offset + 1] & 0xf0) !== 0xf0) {
+                offset++;
+                continue;
+            }
+            const length = ((buf[offset + 3] & 0x03) << 11) | (buf[offset + 4] << 3) | (buf[offset + 5] >> 5);
+            if (length < 7) {
+                offset++;
+                continue;
+            }
+            if (buf.length - offset < length)
+                break;
+            yield Buffer.from(buf.subarray(offset, offset + length));
+            offset += length;
+        }
+        this.partial = Buffer.from(buf.subarray(offset));
     }
 }
 
