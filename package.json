@@ -20,7 +20,8 @@
     "type": "DeviceProvider",
     "interfaces": [
       "DeviceProvider",
-      "Settings"
+      "Settings",
+      "HttpRequestHandler"
     ],
     "pluginDependencies": [
       "@scrypted/prebuffer-mixin",

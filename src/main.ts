@@ -1,9 +1,10 @@
 import sdk, {
-    Device, DeviceProvider, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, SettingValue,
+    Device, DeviceProvider, HttpRequest, HttpRequestHandler, HttpResponse, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, SettingValue,
 } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { randomBytes } from 'crypto';
 import { RecordingArchive } from './archive';
+import { serveClip } from './clip-server';
 import { BatteryAlerts } from './battery-alert';
 import { h264EncoderArgs } from './encoder';
 import type { H264Transcode } from './media';
@@ -14,7 +15,7 @@ import workerBundle from './generated/worker.json';
 import type { AuthState, DoorbellInfo } from './protocol';
 import { WorkerHost } from './worker-host';
 
-const { deviceManager, mediaManager } = sdk;
+const { deviceManager, endpointManager, mediaManager } = sdk;
 
 const NOTIFICATION_STYLES: Record<number, string> = {
     1: 'Text Only',
@@ -22,7 +23,7 @@ const NOTIFICATION_STYLES: Record<number, string> = {
     3: 'Text First, Then Thumbnail',
 };
 
-class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings {
+class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings, HttpRequestHandler {
     private readonly cameras = new Map<string, EufyDoorbell>();
     private readonly worker: WorkerHost;
     private readonly archive: RecordingArchive;
@@ -184,6 +185,11 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
         this.start();
     }
 
+    /** Archived clip files for Scrypted NVR's player (see clip-server.ts). */
+    async onRequest(request: HttpRequest, response: HttpResponse): Promise<void> {
+        serveClip(request, response, this.archive);
+    }
+
     async getSettings(): Promise<Setting[]> {
         return this.storageSettings.getSettings();
     }
@@ -210,6 +216,7 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
                 thumbnails: this.thumbnails,
                 maxLiveSeconds: () => Number(this.storageSettings.values.maxLiveSeconds) || 300,
                 transcode: () => this.transcode(),
+                clipUrlBase: async () => `${await endpointManager.getAuthenticatedPath(this.nativeId)}clips/`,
             });
             this.cameras.set(nativeId, camera);
         }
@@ -304,9 +311,6 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
                     ScryptedInterface.MotionSensor,
                     ScryptedInterface.Online,
                     ScryptedInterface.VideoClips,
-                    // What Scrypted NVR needs to list and play events (it seeks the recording to the event's time).
-                    ScryptedInterface.VideoRecorder,
-                    ScryptedInterface.EventRecorder,
                     ScryptedInterface.ObjectDetector,
                     ...(info.hasTalkback ? [ScryptedInterface.Intercom] : []),
                     // Battery is also what tells Rebroadcast not to prebuffer (keep the doorbell awake) by default.

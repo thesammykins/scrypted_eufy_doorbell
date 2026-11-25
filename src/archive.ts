@@ -109,24 +109,6 @@ export class RecordingArchive {
         return this.resolve(id, '.jpg');
     }
 
-    /**
-     * The clip playing at `time` (or, between clips, the next one to start within `lookaheadMs`), with the
-     * offset into it. Used to answer NVR's "play from this moment" requests.
-     */
-    clipAt(sn: string, time: number, lookaheadMs = 5 * 60 * 1000): { path: string; startTime: number; offsetMs: number; durationMs: number } | undefined {
-        const clips = this.list(sn).sort((a, b) => a.startTime - b.startTime);
-        const covering = clips.find(c => c.startTime <= time && time < c.startTime + (c.duration ?? 0));
-        const clip = covering ?? clips.find(c => c.startTime > time && c.startTime - time <= lookaheadMs);
-        if (!clip)
-            return undefined;
-        return {
-            path: this.videoPath(clip.id),
-            startTime: clip.startTime,
-            offsetMs: covering ? time - clip.startTime : 0,
-            durationMs: clip.duration ?? 0,
-        };
-    }
-
     latestThumbnail(sn: string): string | undefined {
         const latest = this.list(sn, { count: 1 })[0];
         const file = latest && this.thumbnailPath(latest.id);
