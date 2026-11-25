@@ -3,6 +3,8 @@ import fs from 'fs';
 import path from 'path';
 import { promisify } from 'util';
 import type { VideoClip, VideoClipOptions } from '@scrypted/sdk';
+import { viewFor } from './lenses';
+import type { H264Transcode } from './media';
 import type { RecordingEntry } from './protocol';
 import type { WorkerHost } from './worker-host';
 
@@ -15,13 +17,14 @@ export interface ArchivePolicy {
     retentionDays(): number;
     /** Seconds to wait after a ring before syncing: Eufy must have finished writing the clip. */
     downloadDelaySeconds(): number;
-    ffmpegPath(): Promise<string>;
+    transcode(): Promise<H264Transcode>;
 }
 
 // A second pass after a ring catches a clip that was still being written on the first.
 const SECOND_PASS_S = 120;
 const PERIODIC_SYNC_MS = 30 * 60 * 1000;
 const LOOKBACK_DAYS = 2;
+const VIEW_EXT = '.view.mp4';
 
 /**
  * Keeps a copy of the clip Eufy records on the HomeBase for each ring (and optionally motion): full
@@ -29,7 +32,9 @@ const LOOKBACK_DAYS = 2;
  * rather than trusting push payloads, so a restart, a missed push or an earlier ring is caught up on the next
  * pass. Nothing here wakes the doorbell: the index and the clips live on the wired HomeBase.
  *
- * Stored as `<volume>/recordings/<sn>/<startMs>-<kind>.mp4` + `.jpg` + `.json`.
+ * Stored as `<volume>/recordings/<sn>/<startMs>-<kind>.mp4` (Eufy's original, untouched: H.265, stacked
+ * lenses, full resolution) + `.view.mp4` (what gets played: H.264 in the same composed layout as the live
+ * view, which browsers and HomeKit can actually decode) + `.jpg` (from the view) + `.json`.
  */
 export class RecordingArchive {
     private readonly root: string;
@@ -94,8 +99,10 @@ export class RecordingArchive {
         return options?.count ? clips.slice(0, options.count) : clips;
     }
 
+    /** The playable copy, or the original for a clip whose copy has not been made yet. */
     videoPath(id: string) {
-        return this.resolve(id, '.mp4');
+        const view = this.resolve(id, VIEW_EXT);
+        return fs.existsSync(view) ? view : this.resolve(id, '.mp4');
     }
 
     thumbnailPath(id: string) {
@@ -110,7 +117,7 @@ export class RecordingArchive {
 
     remove(ids: string[]) {
         for (const id of ids)
-            for (const ext of ['.mp4', '.jpg', '.json'])
+            for (const ext of ['.mp4', VIEW_EXT, '.jpg', '.json'])
                 fs.rmSync(this.resolve(id, ext), { force: true });
     }
 
@@ -122,6 +129,11 @@ export class RecordingArchive {
         this.console.log(`clip sync (${reason}): HomeBase has ${entries.length} clips, ${wanted.filter(e => e.isRing).length} rings; ${missing.length} to fetch`);
         for (const entry of missing)
             await this.download(sn, entry);
+        // Clips archived before playable copies existed (or whose copy failed) get one now.
+        for (const clip of this.list(sn)) {
+            if (!fs.existsSync(this.resolve(clip.id, VIEW_EXT)))
+                await this.makeView(sn, this.resolve(clip.id, '.mp4')).catch(e => this.console.warn(`playable copy of ${clip.id} failed: ${(e as Error).message}`));
+        }
         this.prune(sn, cutoff);
     }
 
@@ -137,7 +149,7 @@ export class RecordingArchive {
             const result = await this.worker.call('downloadRecording', { sn, recording: entry.recording, codec: entry.codec, cipherId: entry.cipherId, outPath: partial });
             fs.renameSync(partial, outPath);
             fs.writeFileSync(outPath.replace(/\.mp4$/, '.json'), JSON.stringify({ recording: entry.recording, codec: entry.codec, ...result }));
-            await this.writeThumbnail(outPath);
+            await this.makeView(sn, outPath);
             this.console.log(`archived ${entry.isRing ? 'ring' : 'motion'} clip ${entry.recording} (${Math.round(result.durationMs / 1000)}s, ${result.fps}fps, audio ${result.hasAudio}) in ${Date.now() - started}ms`);
         }
         catch (err) {
@@ -155,9 +167,25 @@ export class RecordingArchive {
         }
     }
 
-    private async writeThumbnail(videoPath: string) {
-        const ffmpeg = await this.policy.ffmpegPath();
-        await execFileAsync(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-ss', '1', '-i', videoPath, '-frames:v', '1', '-q:v', '3', videoPath.replace(/\.mp4$/, '.jpg')]);
+    /**
+     * The playable copy: H.264 (the original is H.265, which most browsers will not play) composed into the
+     * doorbell's live-view layout, plus its thumbnail. Written to a temp name and renamed, so a half-made
+     * copy is never served.
+     */
+    private async makeView(sn: string, originalPath: string) {
+        const { ffmpegPath, encoderArgs } = await this.policy.transcode();
+        const view = viewFor(sn);
+        const viewPath = originalPath.replace(/\.mp4$/, VIEW_EXT);
+        const partial = `${viewPath}.part.mp4`;
+        const started = Date.now();
+        await execFileAsync(ffmpegPath, [
+            '-hide_banner', '-loglevel', 'error', '-y', '-i', originalPath,
+            ...(view ? ['-vf', view.filter] : []),
+            ...encoderArgs, '-c:a', 'copy', '-movflags', '+faststart', partial,
+        ], { maxBuffer: 16 * 1024 * 1024 });
+        fs.renameSync(partial, viewPath);
+        await execFileAsync(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-y', '-ss', '1', '-i', viewPath, '-frames:v', '1', '-q:v', '3', originalPath.replace(/\.mp4$/, '.jpg')]);
+        this.console.log(`playable copy of ${path.basename(originalPath)} made in ${Date.now() - started}ms`);
     }
 
     private resolve(id: string, ext: string) {

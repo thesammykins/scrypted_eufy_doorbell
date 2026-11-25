@@ -186,9 +186,9 @@ export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Cam
         return this.context.archive.list(this.sn, options);
     }
 
+    /** An in-memory MP4 (a few MB): Scrypted's players can turn that into a URL, which a bare file path is not. */
     async getVideoClip(videoId: string): Promise<MediaObject> {
-        const file = this.context.archive.videoPath(videoId);
-        return mediaManager.createFFmpegMediaObject({ url: file, inputArguments: ['-i', file] });
+        return mediaManager.createMediaObject(await fs.promises.readFile(this.context.archive.videoPath(videoId)), 'video/mp4');
     }
 
     async getVideoClipThumbnail(thumbnailId: string): Promise<MediaObject> {

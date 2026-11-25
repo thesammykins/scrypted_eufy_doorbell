@@ -6,6 +6,7 @@ import { randomBytes } from 'crypto';
 import { RecordingArchive } from './archive';
 import { BatteryAlerts } from './battery-alert';
 import { h264EncoderArgs } from './encoder';
+import type { H264Transcode } from './media';
 import { viewFor } from './lenses';
 import { EufyDoorbell } from './doorbell';
 import { ThumbnailStore } from './stills';
@@ -174,7 +175,7 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
             archiveMotion: () => !!this.storageSettings.values.archiveMotion,
             retentionDays: () => Number(this.storageSettings.values.retentionDays) || 30,
             downloadDelaySeconds: () => Number(this.storageSettings.values.downloadDelaySeconds) || 45,
-            ffmpegPath: () => mediaManager.getFFmpegPath(),
+            transcode: () => this.transcode(),
         }, this.console);
         this.wireWorker();
         this.worker.warm();
@@ -208,14 +209,16 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
                 archive: this.archive,
                 thumbnails: this.thumbnails,
                 maxLiveSeconds: () => Number(this.storageSettings.values.maxLiveSeconds) || 300,
-                transcode: async () => {
-                    const ffmpegPath = await mediaManager.getFFmpegPath();
-                    return { ffmpegPath, encoderArgs: await h264EncoderArgs(ffmpegPath, this.storageSettings.values.h264EncoderArguments, this.console) };
-                },
+                transcode: () => this.transcode(),
             });
             this.cameras.set(nativeId, camera);
         }
         return camera;
+    }
+
+    private async transcode(): Promise<H264Transcode> {
+        const ffmpegPath = await mediaManager.getFFmpegPath();
+        return { ffmpegPath, encoderArgs: await h264EncoderArgs(ffmpegPath, this.storageSettings.values.h264EncoderArguments, this.console) };
     }
 
     /** Events only reach doorbells Scrypted already knows about. */
