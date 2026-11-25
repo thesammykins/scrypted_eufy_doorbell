@@ -402,100 +402,188 @@ function jsonStore<T>(kind: 'session' | 'push', initial: unknown) {
 
 // --- live media ---
 
-async function startLive(sn: string, maxSeconds: number): Promise<LiveStreamInfo> {
-    const cam = await cameraOf(sn);
-    if (!cam.live)
-        throw new Error('this camera has no live stream');
-    const stream: LiveStreamConsumer = await cam.live();
-    const streamId = randomUUID();
-    const startedAt = Date.now();
+// A late joiner gets everything since the last keyframe replayed so it can decode at once; beyond this much,
+// drop the cache and let it wait for the next keyframe instead.
+const MAX_GOP_BYTES = 16 * 1024 * 1024;
 
-    const videoOut = new SocketSink('video');
-    const audioOut = new SocketSink('audio');
-    let videoCodec: VideoCodec | undefined;
-    let size: { width?: number; height?: number } = {};
-    let audioFormat: AudioFormat | undefined;
-    let gotKeyframe!: () => void;
-    const firstKeyframe = new Promise<void>(resolve => gotKeyframe = resolve);
-    let gotAudio!: () => void;
-    const firstAudio = new Promise<void>(resolve => gotAudio = resolve);
+interface Viewer {
+    streamId: string;
+    startedAt: number;
+    maxSeconds: number;
+    video: SocketSink;
+    audio: SocketSink;
+}
 
-    let ended = false;
-    const end = (reason: string) => {
-        if (ended)
-            return;
-        ended = true;
-        streams.delete(streamId);
-        stream.stop();
-        videoOut.close();
-        audioOut.close();
-        log.info(`live ${sn} ended after ${Math.round((Date.now() - startedAt) / 1000)}s: ${reason}`);
-        send({ event: 'streamEnded', streamId, reason });
-    };
-    streams.set(streamId, () => end('stopped by plugin'));
+/**
+ * One eufy-sdk live consumer per doorbell, fanned out to every viewer (each stream rendition, each Scrypted
+ * client). The doorbell sends keyframes rarely and eufy-sdk makes each new consumer wait for the next one, so a
+ * second viewer joining a session in progress got "no keyframe within 20s". This keeps the frames since the
+ * last keyframe and replays them to anyone who joins.
+ */
+class SharedLive {
+    private static readonly sessions = new Map<string, Promise<SharedLive>>();
 
-    stream.on('video', frame => {
-        if (!videoCodec) {
-            if (!frame.keyframe)
-                return;
-            if (frame.codec !== 'h264' && frame.codec !== 'h265') {
-                end(`unsupported video codec ${frame.codec}`);
-                return;
+    codec?: VideoCodec;
+    size: { width?: number; height?: number } = {};
+    audioFormat?: AudioFormat;
+    private gop: Buffer[] = [];
+    private gopBytes = 0;
+    private readonly viewers = new Set<Viewer>();
+    private readonly startedAt = Date.now();
+    private ended = false;
+    readonly firstKeyframe: Promise<void>;
+    readonly firstAudio: Promise<void>;
+    private gotKeyframe!: () => void;
+    private gotAudio!: () => void;
+    private failStart!: (e: Error) => void;
+
+    static get(sn: string): Promise<SharedLive> {
+        let session = SharedLive.sessions.get(sn);
+        if (!session) {
+            session = (async () => {
+                const cam = await cameraOf(sn);
+                if (!cam.live)
+                    throw new Error('this camera has no live stream');
+                return new SharedLive(sn, await cam.live());
+            })();
+            SharedLive.sessions.set(sn, session);
+            session.catch(() => SharedLive.sessions.delete(sn));
+        }
+        return session;
+    }
+
+    private constructor(private readonly sn: string, private readonly consumer: LiveStreamConsumer) {
+        let failStart!: (e: Error) => void;
+        this.firstKeyframe = new Promise<void>((resolve, reject) => {
+            this.gotKeyframe = resolve;
+            failStart = reject;
+        });
+        this.failStart = failStart;
+        this.firstKeyframe.catch(() => { });
+        this.firstAudio = new Promise<void>(resolve => this.gotAudio = resolve);
+
+        consumer.on('video', frame => {
+            if (frame.keyframe) {
+                if (!this.codec) {
+                    if (frame.codec !== 'h264' && frame.codec !== 'h265') {
+                        this.end(`unsupported video codec ${frame.codec}`);
+                        return;
+                    }
+                    this.codec = frame.codec;
+                    this.size = { width: frame.width, height: frame.height };
+                    this.gotKeyframe();
+                }
+                this.gop = [];
+                this.gopBytes = 0;
             }
-            videoCodec = frame.codec;
-            size = { width: frame.width, height: frame.height };
-            gotKeyframe();
-        }
-        videoOut.write(frame.data);
-    });
-    stream.on('audio', frame => {
-        if (!audioFormat) {
-            if (frame.codec !== 'aac-lc' && frame.codec !== 'g711a')
-                return; // aac-eld has no container ffmpeg can read from a raw socket; video still plays
-            audioFormat = frame.codec;
-            gotAudio();
-        }
-        if (frame.codec === audioFormat)
-            audioOut.write(frame.data);
-    });
-    stream.on('video-config', config => log.debug(`live ${sn} video config ${config.codec} ${config.width}x${config.height}`));
-    stream.on('error', err => end(`stream error: ${err.message}`));
-    stream.on('stop', () => end('camera stopped streaming'));
-    stream.on('budget', notice => {
-        const elapsed = (Date.now() - startedAt) / 1000;
-        // The budget belongs to the shared pull, which may predate this consumer. This consumer only exists
-        // while its viewer is connecting or watching (a disconnect stops it), so keep extending up to maxSeconds.
-        if (elapsed < maxSeconds) {
-            log.debug(`live ${sn} battery budget reached at ${Math.round(elapsed)}s, extending`);
-            notice.extend();
-        }
-        else {
-            log.info(`live ${sn} reached the ${maxSeconds}s live view cap, letting the camera sleep`);
-        }
-    });
+            if (!this.codec)
+                return;
+            if (this.gopBytes + frame.data.length <= MAX_GOP_BYTES) {
+                this.gop.push(frame.data);
+                this.gopBytes += frame.data.length;
+            }
+            for (const viewer of this.viewers)
+                viewer.video.write(frame.data);
+        });
+        consumer.on('audio', frame => {
+            if (!this.audioFormat) {
+                if (frame.codec !== 'aac-lc' && frame.codec !== 'g711a')
+                    return; // aac-eld has no container ffmpeg can read from a raw socket; video still plays
+                this.audioFormat = frame.codec;
+                this.gotAudio();
+            }
+            if (frame.codec === this.audioFormat) {
+                for (const viewer of this.viewers)
+                    viewer.audio.write(frame.data);
+            }
+        });
+        consumer.on('video-config', config => log.debug(`live ${sn} video config ${config.codec} ${config.width}x${config.height}`));
+        consumer.on('error', err => this.end(`stream error: ${err.message}`));
+        consumer.on('stop', () => this.end('camera stopped streaming'));
+        consumer.on('budget', notice => {
+            // Keep the doorbell up while any viewer is still inside its live-view cap.
+            const now = Date.now();
+            const open = [...this.viewers].some(v => (now - v.startedAt) / 1000 < v.maxSeconds);
+            if (open) {
+                log.debug(`live ${sn} battery budget reached after ${Math.round((now - this.startedAt) / 1000)}s, extending`);
+                notice.extend();
+            }
+            else {
+                log.info(`live ${sn} reached the live view cap, letting the camera sleep`);
+            }
+        });
+    }
 
+    /** Joins a viewer: replays the frames since the last keyframe, then everything live. */
+    attach(viewer: Viewer) {
+        for (const data of this.gop)
+            viewer.video.write(data);
+        this.viewers.add(viewer);
+    }
+
+    detach(viewer: Viewer, reason: string) {
+        if (!this.viewers.delete(viewer))
+            return;
+        viewer.video.close();
+        viewer.audio.close();
+        streams.delete(viewer.streamId);
+        log.info(`live ${this.sn} viewer left after ${Math.round((Date.now() - viewer.startedAt) / 1000)}s: ${reason} (${this.viewers.size} still watching)`);
+        send({ event: 'streamEnded', streamId: viewer.streamId, reason });
+        if (!this.viewers.size)
+            this.end('last viewer left');
+    }
+
+    end(reason: string) {
+        if (this.ended)
+            return;
+        this.ended = true;
+        // Forget this session so the next request opens a fresh pull instead of finding an ended one.
+        SharedLive.sessions.delete(this.sn);
+        this.failStart(new Error(reason));
+        this.consumer.stop();
+        for (const viewer of [...this.viewers])
+            this.detach(viewer, reason);
+        log.info(`live ${this.sn} pull ended after ${Math.round((Date.now() - this.startedAt) / 1000)}s: ${reason}`);
+    }
+
+    get isEnded() {
+        return this.ended;
+    }
+
+    get viewerCount() {
+        return this.viewers.size;
+    }
+}
+
+async function startLive(sn: string, maxSeconds: number): Promise<LiveStreamInfo> {
+    const requestedAt = Date.now();
+    const live = await SharedLive.get(sn);
     const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`no keyframe within ${FIRST_KEYFRAME_TIMEOUT_MS / 1000}s`)), FIRST_KEYFRAME_TIMEOUT_MS));
     try {
-        await Promise.race([firstKeyframe, timeout]);
-        await Promise.race([firstAudio, new Promise(resolve => setTimeout(resolve, AUDIO_SNIFF_MS))]);
+        await Promise.race([live.firstKeyframe, timeout]);
+        await Promise.race([live.firstAudio, new Promise(resolve => setTimeout(resolve, AUDIO_SNIFF_MS))]);
     }
     catch (e) {
-        end((e as Error).message);
+        if (!live.isEnded && live.viewerCount === 0)
+            live.end((e as Error).message);
         throw e;
     }
-    if (ended)
+    if (live.isEnded)
         throw new Error('stream ended before it could be served');
 
-    const videoUrl = await videoOut.listen(() => end('viewer disconnected'));
-    const audioUrl = audioFormat ? await audioOut.listen(() => { }) : undefined;
-    if (!audioFormat)
-        audioOut.close();
+    const viewer: Viewer = { streamId: randomUUID(), startedAt: Date.now(), maxSeconds, video: new SocketSink('video'), audio: new SocketSink('audio') };
+    live.attach(viewer);
+    streams.set(viewer.streamId, () => live.detach(viewer, 'stopped by plugin'));
+    const videoUrl = await viewer.video.listen(() => live.detach(viewer, 'viewer disconnected'));
+    const audioUrl = live.audioFormat ? await viewer.audio.listen(() => { }) : undefined;
+    if (!live.audioFormat)
+        viewer.audio.close();
 
-    log.info(`live ${sn} serving ${videoCodec} ${size.width}x${size.height}, audio ${audioFormat ?? 'none'} (first keyframe after ${Date.now() - startedAt}ms)`);
+    log.info(`live ${sn} serving ${live.codec} ${live.size.width}x${live.size.height}, audio ${live.audioFormat ?? 'none'} (ready after ${Date.now() - requestedAt}ms)`);
     return {
-        streamId,
-        video: { url: videoUrl, codec: videoCodec!, ...size },
-        audio: audioUrl ? { url: audioUrl, format: audioFormat! } : undefined,
+        streamId: viewer.streamId,
+        video: { url: videoUrl, codec: live.codec!, ...live.size },
+        audio: audioUrl ? { url: audioUrl, format: live.audioFormat! } : undefined,
     };
 }
 
@@ -578,24 +666,23 @@ async function startTalkback(sn: string): Promise<TalkbackInfo> {
     // acknowledges talkback frames either way, so audio sent before the doorbell wakes is silently lost.
     // Hold a live pull and wait for its first keyframe (proof the doorbell is up) before talking.
     const started = Date.now();
-    const keepAwake: LiveStreamConsumer = await cam.live();
-    keepAwake.on('error', err => log.warn(`talkback ${sn} live hold: ${err.message}`));
-    keepAwake.on('budget', notice => notice.extend());
+    // Join the shared pull as a silent viewer: it keeps the doorbell streaming for the whole talk, and if
+    // someone is already watching, the doorbell is already awake.
+    const live = await SharedLive.get(sn);
+    const holder: Viewer = { streamId: randomUUID(), startedAt: Date.now(), maxSeconds: TALKBACK_MAX_SECONDS, video: new SocketSink('talkback-hold'), audio: new SocketSink('talkback-hold') };
+    holder.video.close();
+    holder.audio.close();
+    const wakeTimeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`doorbell did not wake within ${FIRST_KEYFRAME_TIMEOUT_MS / 1000}s`)), FIRST_KEYFRAME_TIMEOUT_MS));
     try {
-        await new Promise<void>((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error(`doorbell did not wake within ${FIRST_KEYFRAME_TIMEOUT_MS / 1000}s`)), FIRST_KEYFRAME_TIMEOUT_MS);
-            keepAwake.on('video', frame => {
-                if (frame.keyframe) {
-                    clearTimeout(timer);
-                    resolve();
-                }
-            });
-        });
+        await Promise.race([live.firstKeyframe, wakeTimeout]);
     }
     catch (e) {
-        keepAwake.stop();
+        if (live.viewerCount === 0)
+            live.end((e as Error).message);
         throw e;
     }
+    live.attach(holder);
+    const keepAwake = { stop: () => live.detach(holder, 'talkback ended') };
     log.info(`talkback ${sn}: doorbell awake after ${Date.now() - started}ms`);
     let talk: TalkbackHandle;
     try {
@@ -654,6 +741,8 @@ async function startTalkback(sn: string): Promise<TalkbackInfo> {
     log.info(`talkback ${sn} open (speaker codec ${talk.codec})`);
     return { talkId, url };
 }
+
+const TALKBACK_MAX_SECONDS = 600;
 
 // The SDK paces talkback frames out at exactly realtime and never drops one. Two consequences for a live mic:
 // a late packet leaves the doorbell with a gap (sputter), and a source running even slightly fast builds a

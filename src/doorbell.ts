@@ -1,12 +1,12 @@
 import fs from 'fs';
 import sdk, {
     Battery, BinarySensor, Camera, FFmpegInput, Intercom, MediaObject, MotionSensor, ObjectDetectionTypes, ObjectDetector,
-    ObjectsDetected, Online, ResponseMediaStreamOptions, ResponsePictureOptions, ScryptedDeviceBase, ScryptedInterface,
+    ObjectsDetected, Online, RequestMediaStreamOptions, ResponseMediaStreamOptions, ResponsePictureOptions, ScryptedDeviceBase, ScryptedInterface,
     ScryptedMimeTypes, VideoCamera, VideoClip, VideoClipOptions, VideoClips,
 } from '@scrypted/sdk';
 import type { RecordingArchive } from './archive';
 import { LensView, viewFor } from './lenses';
-import { createFFmpegInput, H264Transcode, streamOptions } from './media';
+import { createFFmpegInput, H264Transcode, STREAM_VARIANTS, streamOptions, variantFor } from './media';
 import type { DoorbellInfo, DetectionClass } from './protocol';
 import { cropStill, placeholderJpeg, ThumbnailStore } from './stills';
 import { startTalkbackEncoder, TalkbackEncoder } from './talkback';
@@ -115,16 +115,17 @@ export class EufyDoorbell extends ScryptedDeviceBase implements VideoCamera, Cam
     // --- VideoCamera: one P2P pull shared by every viewer, gone when the last viewer leaves ---
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
-        return [streamOptions(this.view)];
+        return STREAM_VARIANTS.map(variant => streamOptions(variant, this.view));
     }
 
-    async getVideoStream(): Promise<MediaObject> {
+    async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
+        const variant = variantFor(options?.id);
         const view = this.view;
         const started = Date.now();
         const info = await this.context.worker.call('live', { sn: this.sn, maxSeconds: this.context.maxLiveSeconds() });
-        this.console.log(`live stream ready in ${Date.now() - started}ms: ${info.video.codec} ${info.video.width}x${info.video.height}, audio ${info.audio?.format ?? 'none'}`);
+        this.console.log(`live stream ready in ${Date.now() - started}ms: ${info.video.codec} ${info.video.width}x${info.video.height}, audio ${info.audio?.format ?? 'none'}, serving ${variant.id}`);
         try {
-            const input = await createFFmpegInput(info, this.console, await this.context.transcode(), view);
+            const input = await createFFmpegInput(info, this.console, await this.context.transcode(), variant, view);
             return await mediaManager.createFFmpegMediaObject(input);
         }
         catch (e) {

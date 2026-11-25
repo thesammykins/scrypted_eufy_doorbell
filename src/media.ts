@@ -9,25 +9,74 @@ import type { LiveStreamInfo } from './protocol';
 const LOW_LATENCY_INPUT = ['-fflags', '+nobuffer+genpts', '-flags', 'low_delay', '-probesize', '65536', '-analyzeduration', '0'];
 const RAW_INPUT = [...LOW_LATENCY_INPUT, '-thread_queue_size', '1024', '-use_wallclock_as_timestamps', '1'];
 
-const DEFAULT_STREAM_ID = 'p2p';
-
 export interface H264Transcode {
     ffmpegPath: string;
     encoderArgs: string[];
 }
 
-/** Always H.264 + AAC out; a dual-lens doorbell advertises its composed view's fixed size. */
-export function streamOptions(view?: LensView, info?: LiveStreamInfo): ResponseMediaStreamOptions {
+/**
+ * Two renditions of the same P2P pull, each encoded only when someone asks for it.
+ *
+ * - `full`: the doorbell's native resolution, High profile. Local viewing, HomeKit and recordings.
+ * - `compat`: fitted to 1920x1080, Constrained Baseline at level 4.1. Google's cast receivers and WebRTC
+ *   player take nothing else as-is, so without it Scrypted re-encodes every Google session on the CPU before
+ *   the first frame (`transcodeBaseline: true`), on top of the doorbell's wake-up. Remote and low-resolution
+ *   viewers get it too, which is the bucket Google draws from.
+ */
+export interface StreamVariant {
+    id: string;
+    name: string;
+    destinations: Array<'local' | 'remote' | 'medium-resolution' | 'low-resolution' | 'local-recorder' | 'remote-recorder'>;
+    fit?: { width: number; height: number };
+    baseline: boolean;
+}
+
+export const STREAM_VARIANTS: StreamVariant[] = [
+    { id: 'full', name: 'Doorbell', destinations: ['local', 'local-recorder', 'remote-recorder'], baseline: false },
+    { id: 'compat', name: 'Doorbell (1080p)', destinations: ['remote', 'medium-resolution', 'low-resolution'], fit: { width: 1920, height: 1080 }, baseline: true },
+];
+
+export function variantFor(id: string | undefined) {
+    return STREAM_VARIANTS.find(v => v.id === id) ?? STREAM_VARIANTS[0];
+}
+
+/** Always H.264 + AAC out, with the size the stream will actually have. */
+export function streamOptions(variant: StreamVariant, view?: LensView, info?: LiveStreamInfo): ResponseMediaStreamOptions {
+    const native = { width: view?.width ?? info?.video.width, height: view?.height ?? info?.video.height };
+    const size = variant.fit ? fitWithin(native, variant.fit) : native;
     return {
-        id: view?.id ?? DEFAULT_STREAM_ID,
-        name: view?.name ?? 'P2P Livestream',
+        id: variant.id,
+        name: variant.name,
         tool: 'ffmpeg',
+        destinations: variant.destinations,
         // Advertised up front: without a size Scrypted's Adaptive Streaming assumes 16:9 and may squash it.
-        video: { codec: 'h264', width: view?.width ?? info?.video.width, height: view?.height ?? info?.video.height },
+        video: { codec: 'h264', profile: variant.baseline ? 'baseline' : 'high', ...size },
         audio: info && !info.audio ? null : { codec: 'aac' },
         // Battery doorbell: nothing may keep this stream open in the background.
         allowBatteryPrebuffer: false,
     } as ResponseMediaStreamOptions;
+}
+
+function fitWithin(size: { width?: number; height?: number }, box: { width: number; height: number }) {
+    if (!size.width || !size.height)
+        return { ...box };
+    const scale = Math.min(1, box.width / size.width, box.height / size.height);
+    return { width: Math.round(size.width * scale / 2) * 2, height: Math.round(size.height * scale / 2) * 2 };
+}
+
+/** Encoder arguments for a variant: the configured encoder with its profile swapped for Baseline where needed. */
+function encoderFor(variant: StreamVariant, encoderArgs: string[]) {
+    if (!variant.baseline)
+        return encoderArgs;
+    const args: string[] = [];
+    for (let i = 0; i < encoderArgs.length; i++) {
+        if (encoderArgs[i] === '-profile:v' || encoderArgs[i] === '-level') {
+            i++;
+            continue;
+        }
+        args.push(encoderArgs[i]);
+    }
+    return [...args, '-profile:v', 'baseline', '-level', '4.1'];
 }
 
 function rawInputs(info: LiveStreamInfo) {
@@ -51,10 +100,14 @@ function maps(info: LiveStreamInfo) {
  * re-encoded (cheap at 16 kHz mono) so it can be re-timed onto a steady clock.
  * Closing the socket kills the muxer, which closes the worker's sockets, which ends the P2P pull.
  */
-export async function createFFmpegInput(info: LiveStreamInfo, console: Console, transcode: H264Transcode, view?: LensView): Promise<FFmpegInput> {
-    const video = info.video.codec === 'h264' && !view
+export async function createFFmpegInput(info: LiveStreamInfo, console: Console, transcode: H264Transcode, variant: StreamVariant, view?: LensView): Promise<FFmpegInput> {
+    const filters = [
+        ...(view ? [view.filter] : []),
+        ...(variant.fit ? [`scale=w=${variant.fit.width}:h=${variant.fit.height}:force_original_aspect_ratio=decrease:force_divisible_by=2`] : []),
+    ];
+    const video = info.video.codec === 'h264' && !filters.length && !variant.baseline
         ? ['-c:v', 'copy']
-        : [...(view ? ['-vf', view.filter] : []), ...transcode.encoderArgs];
+        : [...(filters.length ? ['-vf', filters.join(',')] : []), ...encoderFor(variant, transcode.encoderArgs)];
     // P2P delivers audio in bursts, so arrival stamps jitter. Re-stamp from the sample count (a steady clock),
     // anchored at the first frame's arrival time so it stays in step with the arrival-stamped video.
     // Never resample to fit the jitter: stretching to it is what made the audio warble.
@@ -73,7 +126,7 @@ export async function createFFmpegInput(info: LiveStreamInfo, console: Console, 
     muxer.once('exit', code => console.log(`muxer exited (${code})`));
     const served = await serveOnce(muxer, console);
     served.done.finally(() => killQuietly(muxer));
-    return { inputArguments: ['-f', 'nut', ...LOW_LATENCY_INPUT, '-i', served.url], mediaStreamOptions: streamOptions(view, info) };
+    return { inputArguments: ['-f', 'nut', ...LOW_LATENCY_INPUT, '-i', served.url], mediaStreamOptions: streamOptions(variant, view, info) };
 }
 
 function serveOnce(encoder: ChildProcess, console: Console): Promise<{ url: string; done: Promise<void> }> {
