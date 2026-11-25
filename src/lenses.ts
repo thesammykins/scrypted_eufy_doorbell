@@ -1,9 +1,10 @@
 /**
  * Doorbells that pack two lenses into one stacked frame (main camera on top, package camera below, a black
  * band between). Viewers (Google Home, HomeKit tiles, the web UI) assume a landscape picture and squash or
- * crop a tall one, so both lenses are composed into a single 16:9 view: the main lens, with the package lens
- * inset over its bottom-left corner. That one view is what everything gets, including recording and object
- * detection.
+ * crop a tall one, so both lenses are composed into a single 16:9 view, neither lens cropped: the main lens
+ * flush left at full height (the driveway, where number plates are, stays clear), and the package lens in the
+ * bottom-right, using the spare width and overlapping only the brick wall at the main lens's right edge.
+ * That one view is what everything gets, including recording and object detection.
  *
  * Crops are proportional to the camera frame height because the camera steps its resolution up and down
  * mid-session, and the output is a fixed size so those steps never reach the viewer.
@@ -26,12 +27,13 @@ const DOORBELL_DUAL_INSET: LensView = {
     name: 'Doorbell',
     filter: [
         'split[a][b]',
-        `[a]${MAIN_CROP},scale=1440:1080,pad=1920:1080:240:0:black[main]`,
-        `[b]${PACKAGE_CROP},scale=640:348[pkg]`,
-        '[main][pkg]overlay=0:732',
+        `[a]${MAIN_CROP},scale=1600:1200,pad=2134:1200:0:0:black[main]`,
+        `[b]${PACKAGE_CROP},scale=868:472[pkg]`,
+        '[main][pkg]overlay=1266:728',
     ].join(';'),
-    width: 1920,
-    height: 1080,
+    // 16:9 sized to the main lens's native 1600x1200, so the main lens is never scaled.
+    width: 2134,
+    height: 1200,
 };
 
 const LAYOUTS: Record<string, LensView> = {

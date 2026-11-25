@@ -186,6 +186,7 @@ async function publishDoorbells(eufy: EufyMega) {
         if (!dev.has('doorbell'))
             continue;
         devices.set(dev.sn, dev);
+        log.debug(`doorbell ${dev.sn} properties: ${safeJson(dev.getProperties())}`);
         const cam = dev.camera?.();
         doorbells.push({
             sn: dev.sn,
@@ -196,10 +197,14 @@ async function publishDoorbells(eufy: EufyMega) {
             hasTalkback: !!cam?.talkback,
             batteryLevel: batteryOf(dev),
         });
-        log.info(`doorbell ${dev.name} (${dev.sn}, ${dev.modelName}, station ${dev.stationSn}) capabilities: ${dev.capabilities.join(', ')}`);
+        log.info(`doorbell ${dev.name} (${dev.sn}, ${dev.modelName}, station ${dev.stationSn}) capabilities: ${dev.capabilities.join(', ')}; live quality ${describeTier(dev.getProperty('streamingQuality'))}, recording quality ${describeTier(dev.getProperty('recordingQuality'))}`);
     }
     send({ event: 'doorbells', doorbells });
     markReady();
+}
+
+function describeTier(value: unknown) {
+    return value === undefined ? 'unknown' : `${value}`;
 }
 
 function batteryOf(dev: Device): number | undefined {
@@ -522,9 +527,23 @@ process.on('message', async (raw: unknown) => {
     }
 });
 
-process.on('disconnect', () => {
+// The worker must never outlive the plugin: an orphan keeps the same eufy identity and push credentials,
+// and two of those knock each other's push connection off (no ring events) and race for media.
+let exiting = false;
+function exitWithParent(reason: string) {
+    if (exiting)
+        return;
+    exiting = true;
+    log.info(`worker exiting: ${reason}`);
+    setTimeout(() => process.exit(0), 3_000).unref();
     shutdownClient().finally(() => process.exit(0));
-});
+}
+process.on('disconnect', () => exitWithParent('plugin disconnected'));
+const parentPid = process.ppid;
+setInterval(() => {
+    if (!process.connected || process.ppid !== parentPid)
+        exitWithParent('plugin process is gone');
+}, 5_000).unref();
 process.on('uncaughtException', e => log.error('worker uncaught exception', e));
 process.on('unhandledRejection', e => log.error('worker unhandled rejection', e));
 

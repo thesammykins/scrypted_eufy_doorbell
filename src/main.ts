@@ -4,6 +4,7 @@ import sdk, {
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { randomBytes } from 'crypto';
 import { RecordingArchive } from './archive';
+import { h264EncoderArgs } from './encoder';
 import { viewFor } from './lenses';
 import { EufyDoorbell } from './doorbell';
 import { ThumbnailStore } from './stills';
@@ -12,8 +13,6 @@ import type { AuthState, DoorbellInfo } from './protocol';
 import { WorkerHost } from './worker-host';
 
 const { deviceManager, mediaManager } = sdk;
-
-const DEFAULT_H264_ENCODER = '-c:v libx264 -preset ultrafast -tune zerolatency -profile:v high -pix_fmt yuv420p -g 30 -bf 0';
 
 class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings {
     private readonly cameras = new Map<string, EufyDoorbell>();
@@ -92,9 +91,8 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
             group: 'Recordings',
         },
         h264EncoderArguments: {
-            title: 'H.265 to H.264 Encoder',
-            description: 'ffmpeg arguments, used only for cameras that stream H.265.',
-            defaultValue: DEFAULT_H264_ENCODER,
+            title: 'H.264 Encoder Override',
+            description: 'ffmpeg encoder arguments. Leave empty to use the GPU (NVENC) when available, else libx264.',
             group: 'Advanced',
         },
         debugLogging: {
@@ -154,10 +152,10 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
                 archive: this.archive,
                 thumbnails: this.thumbnails,
                 maxLiveSeconds: () => Number(this.storageSettings.values.maxLiveSeconds) || 300,
-                transcode: async () => ({
-                    ffmpegPath: await mediaManager.getFFmpegPath(),
-                    encoderArgs: String(this.storageSettings.values.h264EncoderArguments).split(' ').filter(Boolean),
-                }),
+                transcode: async () => {
+                    const ffmpegPath = await mediaManager.getFFmpegPath();
+                    return { ffmpegPath, encoderArgs: await h264EncoderArgs(ffmpegPath, this.storageSettings.values.h264EncoderArguments, this.console) };
+                },
             });
             this.cameras.set(nativeId, camera);
         }

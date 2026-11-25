@@ -1,5 +1,7 @@
 import { ChildProcess, fork } from 'child_process';
 import { EventEmitter } from 'events';
+import fs from 'fs';
+import path from 'path';
 import type { Method, Methods, Response, WorkerEvent, WorkerMessage } from './protocol';
 import { ensureNodeRuntime, installWorker, WorkerBundle } from './node-runtime';
 
@@ -63,6 +65,8 @@ export class WorkerHost extends EventEmitter<EventMap> {
     private async spawn() {
         const runtime = await ensureNodeRuntime(this.volume, this.console);
         const entry = await installWorker(this.volume, runtime, this.bundle, this.console);
+        const pidFile = path.join(path.dirname(entry), 'worker.pid');
+        killStaleWorker(pidFile, entry, this.console);
         const child = fork(entry, [], {
             execPath: runtime.node,
             execArgv: [],
@@ -90,6 +94,8 @@ export class WorkerHost extends EventEmitter<EventMap> {
             child.once('spawn', resolve);
             child.once('error', reject);
         });
+        if (child.pid)
+            fs.writeFileSync(pidFile, String(child.pid));
     }
 
     private onMessage(message: WorkerMessage) {
@@ -107,5 +113,27 @@ export class WorkerHost extends EventEmitter<EventMap> {
             return;
         }
         (this.emit as (event: string, payload: WorkerEvent) => boolean)(message.event, message);
+    }
+}
+
+/** A worker left behind by a crashed or force-killed plugin instance would fight the new one; end it. */
+function killStaleWorker(pidFile: string, entry: string, console: Console) {
+    let pid: number;
+    try {
+        pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    }
+    catch {
+        return;
+    }
+    try {
+        // Only kill it if that pid is still our worker (pids get reused).
+        const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+        if (!cmdline.includes(entry))
+            return;
+        process.kill(pid, 'SIGKILL');
+        console.warn(`killed stale eufy worker ${pid}`);
+    }
+    catch {
+        // not running (or no /proc on this platform)
     }
 }
