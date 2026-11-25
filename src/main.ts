@@ -4,6 +4,7 @@ import sdk, {
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { randomBytes } from 'crypto';
 import { RecordingArchive } from './archive';
+import { BatteryAlerts } from './battery-alert';
 import { h264EncoderArgs } from './encoder';
 import { viewFor } from './lenses';
 import { EufyDoorbell } from './doorbell';
@@ -19,6 +20,8 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
     private readonly worker: WorkerHost;
     private readonly archive: RecordingArchive;
     private readonly thumbnails: ThumbnailStore;
+    private readonly batteryAlerts: BatteryAlerts;
+    private readonly names = new Map<string, string>();
     private auth: AuthState = { kind: 'signedOut' };
 
     readonly storageSettings = new StorageSettings(this, {
@@ -90,6 +93,19 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
             defaultValue: 45,
             group: 'Recordings',
         },
+        lowBatteryThreshold: {
+            title: 'Low Battery Alert (%)',
+            type: 'number',
+            defaultValue: 20,
+            group: 'Battery',
+        },
+        batteryNotifiers: {
+            title: 'Send Low Battery Alerts To',
+            type: 'device',
+            multiple: true,
+            deviceFilter: `interfaces.includes('${ScryptedInterface.Notifier}')`,
+            group: 'Battery',
+        },
         h264EncoderArguments: {
             title: 'H.264 Encoder Override',
             description: 'ffmpeg encoder arguments. Leave empty to use the GPU (NVENC) when available, else libx264.',
@@ -104,6 +120,7 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
         // Internal state, never shown: this install's identity and the persisted eufy session/push credentials.
         openudid: { hide: true },
         session: { hide: true, json: true },
+        batteryAlerted: { hide: true, json: true },
         push: { hide: true, json: true },
     });
 
@@ -114,6 +131,12 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
             throw new Error('SCRYPTED_PLUGIN_VOLUME is not set');
         this.worker = new WorkerHost(volume, workerBundle, this.console, () => this.start());
         this.thumbnails = new ThumbnailStore(volume);
+        this.batteryAlerts = new BatteryAlerts({
+            threshold: () => Number(this.storageSettings.values.lowBatteryThreshold) || 20,
+            notifierIds: () => [this.storageSettings.values.batteryNotifiers ?? []].flat().filter(Boolean),
+            alerted: sn => !!(this.storageSettings.values.batteryAlerted || {})[sn],
+            setAlerted: (sn, alerted) => this.storageSettings.values.batteryAlerted = { ...(this.storageSettings.values.batteryAlerted || {}), [sn]: alerted },
+        }, this.console);
         this.archive = new RecordingArchive(volume, this.worker, {
             archiveMotion: () => !!this.storageSettings.values.archiveMotion,
             retentionDays: () => Number(this.storageSettings.values.retentionDays) || 30,
@@ -210,7 +233,11 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
         });
         w.on('motion', e => this.knownDoorbell(e.sn)?.onMotion());
         w.on('detection', e => this.knownDoorbell(e.sn)?.onDetection(e.className, e.label));
-        w.on('battery', e => this.knownDoorbell(e.sn)?.onBattery(e.level));
+        w.on('battery', e => {
+            this.knownDoorbell(e.sn)?.onBattery(e.level);
+            this.batteryAlerts.onLevel(e.sn, this.names.get(e.sn) ?? e.sn, e.level);
+        });
+        w.on('batteryAlert', e => this.batteryAlerts.onEufyAlert(this.names.get(e.sn) ?? e.sn, e.state));
         w.on('recordingAvailable', e => this.archive.onRecordingAvailable(e));
         w.on('talkbackEnded', e => {
             for (const camera of this.cameras.values())
@@ -255,6 +282,9 @@ class EufyPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
         for (const info of doorbells) {
             this.console.log(`doorbell ${info.name} (${info.model}, ${info.sn}) battery=${info.hasBattery} talkback=${info.hasTalkback} view=${viewFor(info.sn)?.name ?? 'single lens'}`);
             this.getCamera(info.sn).update(info);
+            this.names.set(info.sn, info.name);
+            if (info.batteryLevel !== undefined)
+                this.batteryAlerts.onLevel(info.sn, info.name, info.batteryLevel);
         }
         this.archive.prune();
     }

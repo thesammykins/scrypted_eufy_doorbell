@@ -89,6 +89,7 @@ export type WorkerEvent =
     /** Eufy's own on-camera classification for an event. */
     | { event: 'detection'; sn: string; className: DetectionClass; label: string }
     | { event: 'battery'; sn: string; level: number }
+    | { event: 'batteryAlert'; sn: string; state?: 'low' | 'hot' | 'full' }
     /** An event push named a recording the HomeBase is storing; `eventName` is the SDK's semantic name. */
     | { event: 'recordingAvailable'; sn: string; recording: string; cipherId: number; eventName?: string; at: number }
     | { event: 'streamEnded'; streamId: string; reason: string }

@@ -225,6 +225,7 @@ function wireEvents(eufy: EufyMega) {
     eufy.on('vehicleDetected', detect('vehicle', 'vehicle'));
     eufy.on('petDetection', detect('animal', 'pet'));
     eufy.on('dogDetected', detect('animal', 'dog'));
+    eufy.on('batteryAlert', e => e.deviceSn && devices.has(e.deviceSn) && send({ event: 'batteryAlert', sn: e.deviceSn, state: e.state }));
     eufy.on('propertyChanged', e => {
         const dev = devices.get(e.deviceSn);
         const level = dev && batteryOf(dev);
@@ -232,6 +233,7 @@ function wireEvents(eufy: EufyMega) {
             send({ event: 'battery', sn: e.deviceSn, level });
     });
     eufy.on('push', ev => {
+        log.debug(`push ${ev.eventName ?? '?'} type ${ev.eventType ?? '?'} device ${ev.deviceSn ?? '?'} cipher ${ev.cipher ?? '-'} payload ${safeJson(ev.payload)}`);
         const recording = ev.payload?.p;
         if (ev.deviceSn && devices.has(ev.deviceSn) && typeof recording === 'string' && ev.cipher !== undefined) {
             log.debug(`push ${ev.eventName ?? ev.eventType} for ${ev.deviceSn} names recording ${recording}`);
@@ -451,11 +453,42 @@ class SocketSink {
 
 async function startTalkback(sn: string): Promise<TalkbackInfo> {
     const cam = await cameraOf(sn);
-    if (!cam.talkback)
+    if (!cam.talkback || !cam.live)
         throw new Error('this camera has no speaker');
-    const talk: TalkbackHandle = await cam.talkback();
+    // The doorbell only plays host audio while it is actually streaming; behind a HomeBase the station
+    // acknowledges talkback frames either way, so audio sent before the doorbell wakes is silently lost.
+    // Hold a live pull and wait for its first keyframe (proof the doorbell is up) before talking.
+    const started = Date.now();
+    const keepAwake: LiveStreamConsumer = await cam.live();
+    keepAwake.on('error', err => log.warn(`talkback ${sn} live hold: ${err.message}`));
+    keepAwake.on('budget', notice => notice.extend());
+    try {
+        await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(`doorbell did not wake within ${FIRST_KEYFRAME_TIMEOUT_MS / 1000}s`)), FIRST_KEYFRAME_TIMEOUT_MS);
+            keepAwake.on('video', frame => {
+                if (frame.keyframe) {
+                    clearTimeout(timer);
+                    resolve();
+                }
+            });
+        });
+    }
+    catch (e) {
+        keepAwake.stop();
+        throw e;
+    }
+    log.info(`talkback ${sn}: doorbell awake after ${Date.now() - started}ms`);
+    let talk: TalkbackHandle;
+    try {
+        talk = await cam.talkback();
+    }
+    catch (e) {
+        keepAwake.stop();
+        throw e;
+    }
     if (talk.codec !== 'aac-lc') {
         await talk.stop();
+        keepAwake.stop();
         throw new Error(`speaker codec ${talk.codec} is not supported (needs an AAC-ELD encoder)`);
     }
     const talkId = randomUUID();
@@ -470,6 +503,7 @@ async function startTalkback(sn: string): Promise<TalkbackInfo> {
         server.close();
         socket?.destroy();
         await talk.stop().catch(() => { });
+        keepAwake.stop();
         log.info(`talkback ${sn} ended: ${reason}`);
         send({ event: 'talkbackEnded', talkId, reason });
     };
